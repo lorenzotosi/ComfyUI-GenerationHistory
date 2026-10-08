@@ -25,8 +25,9 @@ Connect the node after an image-producing node:
 VAE Decode → Generation History → Save Image
 ```
 
-The newest run appears first. Scroll vertically between runs and horizontally
-through images in a run. Select a thumbnail to open the full-resolution image.
+New runs are added at the bottom. Scroll vertically between runs and
+horizontally through images in a run. Every row uses the same thumbnail size.
+Select a thumbnail to open the full-resolution image.
 Enabling persistence loads previously saved rows immediately; it does not save
 temporary rows retroactively.
 

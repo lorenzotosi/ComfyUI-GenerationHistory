@@ -3,7 +3,7 @@
 `Generation History` is a ComfyUI image pass-through node that keeps every
 queued workflow execution as one comparison row. A normal 20-image batch and
 20 sequential one-image invocations both produce one run with 20 non-wrapping
-thumbnails; the next Queue Prompt adds a new row above it.
+thumbnails; the next Queue Prompt adds a new row below it.
 
 It is designed for quick visual comparisons while changing checkpoints,
 diffusion models, LoRAs, prompts, seeds or sampler settings without leaving the
@@ -20,7 +20,7 @@ Model A comparison · Seed: 123 · Model: model-a.safetensors
 ## Features
 
 - One Queue Prompt = one run, across normal batches and sequential/list calls.
-- Newest run first, vertical history scroll, independent horizontal row scroll.
+- Oldest run first, vertical history scroll, independent horizontal row scroll.
 - Full-resolution lightbox with close, `Esc`, previous and next controls.
 - Automatic best-effort seed, UNet/checkpoint and LoRA metadata detection.
 - Responsive rows, headers and thumbnails that follow live node resizing.
@@ -185,14 +185,14 @@ values display as `Unknown`. Overrides take precedence over automatic values.
 ## Manual acceptance checks
 
 1. Queue batches of 10, 10 and 20 images in three Queue Prompts. Confirm three
-   rows newest-first, with 20 thumbnails on one horizontal strip.
+   rows oldest-first, with 20 thumbnails on one horizontal strip.
 2. Queue 30 runs. Confirm vertical scrolling and that no row disappears.
 3. Open a thumbnail. Confirm full-resolution display, `Esc`, `×`, backdrop
    close and arrow navigation.
 4. Delete a middle row. Confirm only that row and its files disappear.
 5. Clear the node. Confirm other Generation History nodes are unchanged.
 6. With persistence ON, restart ComfyUI and reload the workflow. Confirm the
-   runs return newest-first and numbering continues.
+   runs return oldest-first and numbering continues.
 7. Queue an unchanged workflow twice. Confirm two new rows are created.
 8. Duplicate the node. Confirm each node receives only its own later runs.
 9. Use a sequential/list workflow with six one-image invocations. Confirm one
@@ -202,7 +202,7 @@ values display as `Unknown`. Overrides take precedence over automatic values.
 11. In a workflow with separate UNET and CLIP loaders, confirm that the main
     diffusion model is shown instead of the text encoder.
 12. Resize the node between 500, 1000 and 1400 px. Confirm the gallery, header
-    and thumbnail sizing update immediately.
+    and the same thumbnail sizing on rows containing 1, 2 or 6 images.
 
 ## Development checks
 

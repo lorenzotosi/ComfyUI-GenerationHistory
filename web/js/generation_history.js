@@ -170,12 +170,9 @@ function setupNode(node) {
     const runKey = (run) => String(run.execution_id || `legacy:${run.id}`);
 
     function updateRowSize(ref) {
-        const count = ref.run.images?.length || 1;
-        const columns = Math.min(count, 3);
         const available = ref.scroller.clientWidth;
         if (!available) return;
-        const maximum = count === 1 ? 480 : count === 2 ? 360 : count === 3 ? 300 : 240;
-        const fittedSize = Math.max(160, Math.min(maximum, Math.floor((available - 6 * (columns - 1)) / columns)));
+        const fittedSize = Math.max(160, Math.min(240, Math.floor((available - 12) / 3)));
         const size = fittedSize * 2;
         ref.row.style.setProperty("--gh-thumb-size", `${size}px`);
     }
@@ -277,7 +274,7 @@ function setupNode(node) {
 
     function renderAll(runs) {
         state.runs = [...runs].sort((a, b) =>
-            (b.id - a.id) || (new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()),
+            (a.id - b.id) || (new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()),
         );
         state.rows.clear();
         scroll.replaceChildren();
@@ -289,12 +286,12 @@ function setupNode(node) {
         updateStats();
     }
 
-    function prependRun(run) {
+    function appendRun(run) {
         if (state.runs.some((item) => runKey(item) === runKey(run))) return;
-        state.runs.unshift(run);
+        state.runs.push(run);
         scroll.querySelector(".gh-empty")?.remove();
-        scroll.prepend(createRow(run).row);
-        scroll.scrollTop = 0;
+        scroll.append(createRow(run).row);
+        requestAnimationFrame(() => { scroll.scrollTop = scroll.scrollHeight; });
         updateStats();
     }
 
@@ -305,7 +302,7 @@ function setupNode(node) {
                 loadHistory(true);
                 return;
             }
-            prependRun(run);
+            appendRun(run);
             return;
         }
         const knownImages = new Set(
