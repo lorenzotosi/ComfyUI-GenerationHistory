@@ -45,10 +45,14 @@ The resulting layout is:
 
 ```text
 ComfyUI-GenerationHistory/
+├── .comfyignore
 ├── __init__.py
 ├── generation_history.py
+├── pyproject.toml
 ├── storage.py
 ├── web/
+│   ├── docs/
+│   │   └── GenerationHistory.md
 │   └── js/
 │       └── generation_history.js
 ├── tests/
@@ -61,6 +65,15 @@ No extra `requirements.txt` is needed. The implementation only uses Python,
 aiohttp, NumPy and Pillow components already required by ComfyUI.
 
 Restart ComfyUI after copying the directory.
+
+## Compatibility
+
+- Python 3.10 or newer.
+- Current ComfyUI releases that provide the execution context API.
+- Windows, macOS and Linux.
+
+The node has no third-party dependencies beyond packages already provided by
+ComfyUI.
 
 ## License
 

@@ -1,0 +1,19 @@
+[project]
+name = "generation-history"
+version = "1.0.0"
+description = "A responsive ComfyUI gallery that groups every queued execution into one comparison row."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+dependencies = []
+classifiers = [
+    "Operating System :: OS Independent",
+]
+
+[project.urls]
+Repository = "https://github.com/lorenzotosi/ComfyUI-GenerationHistory"
+"Bug Tracker" = "https://github.com/lorenzotosi/ComfyUI-GenerationHistory/issues"
+
+[tool.comfy]
+PublisherId = "lorenzotosi"
+DisplayName = "Generation History"
