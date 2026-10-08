@@ -67,7 +67,7 @@ function injectStyles() {
         .gh-delete { margin-left:auto; flex:0 0 auto; width:24px; padding:1px 5px; font-size:15px; line-height:18px; color:#ef9a9a; }
         .gh-images-scroll { box-sizing:border-box; width:100%; min-width:0; overflow-x:auto; overflow-y:hidden; padding-bottom:4px; overscroll-behavior-x:contain; }
         .gh-images { display:flex; flex-flow:row nowrap; gap:6px; width:max-content; }
-        .gh-thumb { box-sizing:border-box; width:var(--gh-thumb-size, 180px); height:var(--gh-thumb-size, 180px); flex:0 0 var(--gh-thumb-size, 180px); object-fit:contain; cursor:zoom-in; border:1px solid rgba(128,128,128,.35); border-radius:4px; background:rgba(0,0,0,.55); }
+        .gh-thumb { box-sizing:border-box; width:var(--gh-thumb-size, 360px); height:var(--gh-thumb-size, 360px); flex:0 0 var(--gh-thumb-size, 360px); object-fit:contain; cursor:zoom-in; border:1px solid rgba(128,128,128,.35); border-radius:4px; background:rgba(0,0,0,.55); }
         .gh-error { color:#ef9a9a; padding:8px; }
         .gh-modal { position:fixed; inset:0; z-index:100000; display:flex; align-items:center; justify-content:center; background:rgba(0,0,0,.88); }
         .gh-modal[hidden] { display:none; }
@@ -172,7 +172,8 @@ function setupNode(node) {
         const available = ref.scroller.clientWidth;
         if (!available) return;
         const maximum = count === 1 ? 480 : count === 2 ? 360 : count === 3 ? 300 : 240;
-        const size = Math.max(160, Math.min(maximum, Math.floor((available - 6 * (columns - 1)) / columns)));
+        const fittedSize = Math.max(160, Math.min(maximum, Math.floor((available - 6 * (columns - 1)) / columns)));
+        const size = fittedSize * 2;
         ref.row.style.setProperty("--gh-thumb-size", `${size}px`);
     }
 
