@@ -7,6 +7,7 @@ import re
 import shutil
 import threading
 import uuid
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -53,7 +54,7 @@ class HistoryStorage:
     @staticmethod
     def _empty_manifest(history_id: str, next_run_id: int = 1) -> dict[str, Any]:
         return {
-            "version": 1,
+            "version": 2,
             "history_id": history_id,
             "next_run_id": max(1, int(next_run_id)),
             "runs": [],
@@ -89,14 +90,18 @@ class HistoryStorage:
             if not isinstance(image, dict):
                 continue
             filename = str(image.get("filename", ""))
-            if IMAGE_FILE_RE.fullmatch(filename):
+            match = IMAGE_FILE_RE.fullmatch(filename)
+            if match:
                 images.append(
                     {
                         "filename": filename,
                         "subfolder": expected_subfolder,
                         "type": "output",
+                        "index": int(match.group(1)),
+                        "seed": image.get("seed", run.get("seed", "Unknown")),
                     }
                 )
+        images.sort(key=lambda item: item["index"])
 
         loras = []
         for lora in run.get("loras", []):
@@ -108,10 +113,16 @@ class HistoryStorage:
                     }
                 )
 
+        seeds = run.get("seeds")
+        if not isinstance(seeds, list):
+            seeds = [run.get("seed", "Unknown")]
+        seeds = list(dict.fromkeys(seed for seed in seeds if seed != "Unknown"))
+
         return {
             "id": run_id,
+            "execution_id": str(run.get("execution_id") or f"legacy:{run_id}"),
             "timestamp": str(run.get("timestamp", "")),
-            "seed": run.get("seed", "Unknown"),
+            "seeds": seeds,
             "model": str(run.get("model") or "Unknown"),
             "label": str(run.get("label") or ""),
             "loras": loras,
@@ -142,7 +153,7 @@ class HistoryStorage:
                 self._scan_next_run_id(history_dir),
             )
             return {
-                "version": 1,
+                "version": 2,
                 "history_id": history_id,
                 "next_run_id": next_run_id,
                 "runs": runs,
@@ -188,9 +199,10 @@ class HistoryStorage:
             raise ValueError(f"unsupported image shape: {array.shape}")
         Image.fromarray(array).save(path, format="PNG", compress_level=4)
 
-    def add_run(
+    def append_images(
         self,
         history_id: str,
+        execution_id: str,
         images: Any,
         *,
         persist: bool,
@@ -199,8 +211,11 @@ class HistoryStorage:
         model: str,
         loras: list[dict[str, Any]],
         label: str,
-    ) -> dict[str, Any]:
+    ) -> tuple[dict[str, Any], list[dict[str, Any]], bool]:
         history_id = self.validate_history_id(history_id)
+        execution_id = str(execution_id or "").strip()
+        if not execution_id or len(execution_id) > 256:
+            raise ValueError("execution_id must be a non-empty string")
         if len(images) < 1:
             raise ValueError("images batch is empty")
 
@@ -209,69 +224,136 @@ class HistoryStorage:
             volatile = self._volatile.setdefault(
                 history_id, self._empty_manifest(history_id)
             )
-            run_id = max(persistent["next_run_id"], volatile["next_run_id"])
+            run = next(
+                (
+                    item
+                    for item in persistent["runs"]
+                    if item["execution_id"] == execution_id
+                ),
+                None,
+            )
+            target = persistent
+            target_persist = True
+            if run is None:
+                run = next(
+                    (
+                        item
+                        for item in volatile["runs"]
+                        if item["execution_id"] == execution_id
+                    ),
+                    None,
+                )
+                target = volatile
+                target_persist = False
+
+            created = run is None
+            if created:
+                run_id = max(persistent["next_run_id"], volatile["next_run_id"])
+                base_dir = (
+                    self._persistent_dir(history_id)
+                    if persist
+                    else self._volatile_dir(history_id)
+                )
+                while (base_dir / f"run_{run_id:06d}").exists():
+                    run_id += 1
+                target = persistent if persist else volatile
+                target_persist = persist
+                run = {
+                    "id": run_id,
+                    "execution_id": execution_id,
+                    "timestamp": timestamp,
+                    "seeds": [],
+                    "model": model or "Unknown",
+                    "label": label,
+                    "loras": [],
+                    "image_count": 0,
+                    "images": [],
+                }
+
+            run_name = f"run_{run['id']:06d}"
             base_dir = (
                 self._persistent_dir(history_id)
-                if persist
+                if target_persist
                 else self._volatile_dir(history_id)
             )
-            while (base_dir / f"run_{run_id:06d}").exists():
-                run_id += 1
-
-            run_name = f"run_{run_id:06d}"
             final_dir = base_dir / run_name
-            temporary_dir = base_dir / f".{run_name}.{uuid.uuid4().hex}.tmp"
-            temporary_dir.mkdir(parents=True, exist_ok=False)
+            final_dir.mkdir(parents=True, exist_ok=True)
+            start_index = max(
+                (image.get("index", -1) for image in run["images"]), default=-1
+            ) + 1
+            saved: list[tuple[Path, Path]] = []
+            committed: list[Path] = []
             try:
-                for index, image in enumerate(images):
-                    self._save_png(image, temporary_dir / f"image_{index:03d}.png")
-                os.replace(temporary_dir, final_dir)
+                for offset, image in enumerate(images):
+                    index = start_index + offset
+                    final_path = final_dir / f"image_{index:03d}.png"
+                    temporary_path = (
+                        final_dir / f".{final_path.name}.{uuid.uuid4().hex}.tmp"
+                    )
+                    saved.append((temporary_path, final_path))
+                    self._save_png(image, temporary_path)
+                for temporary_path, final_path in saved:
+                    os.replace(temporary_path, final_path)
+                    committed.append(final_path)
             except Exception:
-                shutil.rmtree(temporary_dir, ignore_errors=True)
+                for temporary_path, _ in saved:
+                    temporary_path.unlink(missing_ok=True)
+                for final_path in committed:
+                    final_path.unlink(missing_ok=True)
+                if created:
+                    shutil.rmtree(final_dir, ignore_errors=True)
                 raise
 
             prefix = (
                 f"generation_history/{history_id}/{run_name}"
-                if persist
+                if target_persist
                 else f"generation_history/{self.session_name}/{history_id}/{run_name}"
             )
             image_entries = [
                 {
                     "filename": f"image_{index:03d}.png",
                     "subfolder": prefix,
-                    "type": "output" if persist else "temp",
+                    "type": "output" if target_persist else "temp",
+                    "index": index,
+                    "seed": seed,
                 }
-                for index in range(len(images))
+                for index in range(start_index, start_index + len(images))
             ]
-            run = {
-                "id": run_id,
-                "timestamp": timestamp,
-                "seed": seed,
-                "model": model or "Unknown",
-                "label": label,
-                "loras": loras,
-                "image_count": len(image_entries),
-                "images": image_entries,
+            run["images"].extend(image_entries)
+            run["image_count"] = len(run["images"])
+            if seed != "Unknown" and seed not in run["seeds"]:
+                run["seeds"].append(seed)
+            if run["model"] == "Unknown" and model:
+                run["model"] = model
+            if not run["label"] and label:
+                run["label"] = label
+            known_loras = {
+                (item["name"], item.get("strength_model")) for item in run["loras"]
             }
+            run["loras"].extend(
+                item
+                for item in loras
+                if (item["name"], item.get("strength_model")) not in known_loras
+            )
 
-            next_run_id = run_id + 1
-            volatile["next_run_id"] = next_run_id
-            if persist:
-                persistent["next_run_id"] = next_run_id
-                persistent["runs"].insert(0, run)
+            if created:
+                target["runs"].insert(0, run)
+                target["next_run_id"] = run["id"] + 1
+                volatile["next_run_id"] = max(volatile["next_run_id"], run["id"] + 1)
+            if target_persist:
                 self._atomic_write(
-                    self._persistent_dir(history_id) / "manifest.json", persistent
+                    self._persistent_dir(history_id) / "manifest.json", target
                 )
-            else:
-                volatile["runs"].insert(0, run)
-            return run
+            return deepcopy(run), deepcopy(image_entries), created
 
     def get_history(self, history_id: str, *, persist: bool) -> dict[str, Any]:
         history_id = self.validate_history_id(history_id)
         with self._lock_for(history_id):
             if persist:
                 return self._load_persistent_unlocked(history_id)
-            return self._empty_manifest(history_id)
+            return deepcopy(
+                self._volatile.get(history_id, self._empty_manifest(history_id))
+            )
 
     def delete_run(self, history_id: str, run_id: Any) -> bool:
         history_id = self.validate_history_id(history_id)

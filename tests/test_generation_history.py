@@ -32,6 +32,10 @@ sys.modules["folder_paths"] = types.SimpleNamespace(
     get_output_directory=lambda: str(Path(temp_root.name) / "output"),
     get_temp_directory=lambda: str(Path(temp_root.name) / "temp"),
 )
+execution_utils = types.ModuleType("comfy_execution.utils")
+execution_utils.get_executing_context = lambda: None
+sys.modules["comfy_execution"] = types.ModuleType("comfy_execution")
+sys.modules["comfy_execution.utils"] = execution_utils
 sys.modules["server"] = types.SimpleNamespace(
     PromptServer=types.SimpleNamespace(
         instance=types.SimpleNamespace(routes=_Routes(), send_sync=lambda *_args: None)
@@ -93,6 +97,53 @@ class MetadataTests(unittest.TestCase):
     def test_missing_metadata_is_non_fatal(self):
         metadata = generation_history.extract_metadata({}, "1")
         self.assertEqual(metadata, {"seed": "Unknown", "model": "Unknown", "loras": []})
+
+    def test_krea_style_graph_prefers_unet_and_ignores_clip_loader(self):
+        prompt = {
+            "history": {
+                "class_type": "GenerationHistory",
+                "inputs": {"images": ["decode", 0]},
+            },
+            "decode": {
+                "class_type": "VAEDecode",
+                "inputs": {"samples": ["sampler", 0]},
+            },
+            "sampler": {
+                "class_type": "KSampler",
+                "inputs": {
+                    "seed": 456,
+                    "model": ["unet", 0],
+                    "positive": ["sequence", 0],
+                },
+            },
+            "sequence": {
+                "class_type": "ComfyUIPromptSequenceText",
+                "inputs": {"clip": ["clip", 0]},
+            },
+            "clip": {
+                "class_type": "CLIPLoader",
+                "inputs": {"clip_name": "clip.safetensors"},
+            },
+            "unet": {
+                "class_type": "UNETLoader",
+                "inputs": {"unet_name": "flux-unet.safetensors"},
+            },
+        }
+
+        metadata = generation_history.extract_metadata(prompt, "history")
+
+        self.assertEqual(metadata["seed"], 456)
+        self.assertEqual(metadata["model"], "flux-unet.safetensors")
+
+    def test_execution_id_comes_from_current_comfy_context(self):
+        original = generation_history.get_executing_context
+        generation_history.get_executing_context = lambda: types.SimpleNamespace(
+            prompt_id="prompt-123"
+        )
+        try:
+            self.assertEqual(generation_history.current_execution_id(), "prompt-123")
+        finally:
+            generation_history.get_executing_context = original
 
     def test_always_changed_fingerprint_is_nan(self):
         fingerprint = generation_history.GenerationHistory.IS_CHANGED()

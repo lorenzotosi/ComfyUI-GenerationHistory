@@ -51,22 +51,23 @@ function injectStyles() {
     const style = document.createElement("style");
     style.id = "generation-history-styles";
     style.textContent = `
-        .gh-root { box-sizing:border-box; width:100%; height:100%; min-height:360px; display:flex; flex-direction:column; gap:7px; padding:7px; color:var(--input-text, #ddd); font:12px system-ui, sans-serif; background:var(--comfy-input-bg, rgba(20,20,20,.65)); border:1px solid var(--border-color, rgba(128,128,128,.35)); border-radius:7px; overflow:hidden; }
+        .gh-root { box-sizing:border-box; width:100%; height:100%; min-width:0; min-height:360px; display:flex; flex-direction:column; gap:7px; padding:7px; color:var(--input-text, #ddd); font:12px system-ui, sans-serif; background:var(--comfy-input-bg, rgba(20,20,20,.65)); border:1px solid var(--border-color, rgba(128,128,128,.35)); border-radius:7px; overflow:hidden; }
         .gh-toolbar { display:flex; align-items:center; gap:8px; min-height:28px; }
         .gh-title { font-weight:650; white-space:nowrap; }
         .gh-stats { margin-left:auto; opacity:.75; white-space:nowrap; }
         .gh-button { color:inherit; background:var(--comfy-menu-bg, rgba(90,90,90,.35)); border:1px solid var(--border-color, rgba(128,128,128,.45)); border-radius:5px; padding:3px 8px; cursor:pointer; }
         .gh-button:hover { filter:brightness(1.2); }
         .gh-clear { color:#ef9a9a; }
-        .gh-scroll { flex:1 1 auto; min-height:0; overflow-y:auto; overscroll-behavior:contain; scrollbar-gutter:stable; }
+        .gh-scroll { box-sizing:border-box; width:100%; flex:1 1 auto; min-width:0; min-height:0; overflow-y:auto; overscroll-behavior:contain; scrollbar-gutter:stable; }
         .gh-empty { padding:28px 8px; text-align:center; opacity:.6; }
-        .gh-row { margin:0 0 8px; padding:6px; border:1px solid var(--border-color, rgba(128,128,128,.32)); border-radius:6px; background:rgba(127,127,127,.08); }
-        .gh-header { display:flex; align-items:center; gap:7px; margin-bottom:5px; min-height:20px; }
-        .gh-meta { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+        .gh-row { box-sizing:border-box; width:100%; min-width:0; margin:0 0 8px; padding:6px; border:1px solid var(--border-color, rgba(128,128,128,.32)); border-radius:6px; background:rgba(127,127,127,.08); }
+        .gh-header { box-sizing:border-box; width:100%; min-width:0; display:flex; align-items:flex-start; gap:7px; margin-bottom:5px; min-height:20px; }
+        .gh-meta { flex:1 1 auto; min-width:0; white-space:normal; overflow-wrap:anywhere; line-height:1.35; }
         .gh-run { font-weight:700; }
         .gh-delete { margin-left:auto; flex:0 0 auto; width:24px; padding:1px 5px; font-size:15px; line-height:18px; color:#ef9a9a; }
-        .gh-images { display:flex; flex-flow:row nowrap; gap:6px; width:100%; overflow-x:auto; overflow-y:hidden; padding-bottom:4px; overscroll-behavior-x:contain; }
-        .gh-thumb { box-sizing:border-box; width:120px; height:120px; flex:0 0 120px; object-fit:contain; cursor:zoom-in; border:1px solid rgba(128,128,128,.35); border-radius:4px; background:rgba(0,0,0,.55); }
+        .gh-images-scroll { box-sizing:border-box; width:100%; min-width:0; overflow-x:auto; overflow-y:hidden; padding-bottom:4px; overscroll-behavior-x:contain; }
+        .gh-images { display:flex; flex-flow:row nowrap; gap:6px; width:max-content; }
+        .gh-thumb { box-sizing:border-box; width:var(--gh-thumb-size, 180px); height:var(--gh-thumb-size, 180px); flex:0 0 var(--gh-thumb-size, 180px); object-fit:contain; cursor:zoom-in; border:1px solid rgba(128,128,128,.35); border-radius:4px; background:rgba(0,0,0,.55); }
         .gh-error { color:#ef9a9a; padding:8px; }
         .gh-modal { position:fixed; inset:0; z-index:100000; display:flex; align-items:center; justify-content:center; background:rgba(0,0,0,.88); }
         .gh-modal[hidden] { display:none; }
@@ -110,7 +111,7 @@ function setupNode(node) {
     hideHistoryIdWidget(node);
 
     const controller = new AbortController();
-    const state = { runs: [], revision: 0, modalRun: null, modalIndex: 0 };
+    const state = { runs: [], rows: new Map(), revision: 0, modalRun: null, modalIndex: 0 };
     const root = document.createElement("div");
     root.className = "gh-root";
     root.innerHTML = `
@@ -163,20 +164,32 @@ function setupNode(node) {
         state.modalRun = null;
     }
 
-    function createRow(run) {
-        const row = document.createElement("section");
-        row.className = "gh-row";
-        row.dataset.runId = String(run.id);
-        const header = document.createElement("div");
-        header.className = "gh-header";
-        const meta = document.createElement("div");
-        meta.className = "gh-meta";
+    const runKey = (run) => String(run.execution_id || `legacy:${run.id}`);
+
+    function updateRowSize(ref) {
+        const count = ref.run.images?.length || 1;
+        const columns = Math.min(count, 3);
+        const available = ref.scroller.clientWidth;
+        if (!available) return;
+        const maximum = count === 1 ? 480 : count === 2 ? 360 : count === 3 ? 300 : 240;
+        const size = Math.max(160, Math.min(maximum, Math.floor((available - 6 * (columns - 1)) / columns)));
+        ref.row.style.setProperty("--gh-thumb-size", `${size}px`);
+    }
+
+    function updateAllRowSizes() {
+        state.rows.forEach(updateRowSize);
+    }
+
+    function updateHeader(ref) {
+        const { run, meta } = ref;
+        const seeds = run.seeds?.length ? run.seeds : [run.seed ?? "Unknown"];
+        const seedLabel = seeds.length > 1 ? "Seeds" : "Seed";
         const loras = (run.loras || []).map((lora) =>
             `${lora.name}${lora.strength_model == null ? "" : ` @ ${lora.strength_model}`}`,
         );
         const parts = [
             `Run #${run.id}${run.label ? ` · ${run.label}` : ""}`,
-            `Seed: ${run.seed ?? "Unknown"}`,
+            `${seedLabel}: ${seeds.join(", ")}`,
             `Model: ${run.model || "Unknown"}`,
             `${run.image_count ?? run.images?.length ?? 0} images`,
             formatTimestamp(run.timestamp),
@@ -185,8 +198,30 @@ function setupNode(node) {
         const runTitle = document.createElement("span");
         runTitle.className = "gh-run";
         runTitle.textContent = parts.shift();
-        meta.append(runTitle, document.createTextNode(` · ${parts.filter(Boolean).join(" · ")}`));
+        meta.replaceChildren(runTitle, document.createTextNode(` · ${parts.filter(Boolean).join(" · ")}`));
         meta.title = meta.textContent;
+    }
+
+    function appendThumbnail(ref, image, index) {
+        const thumbnail = document.createElement("img");
+        thumbnail.className = "gh-thumb";
+        thumbnail.loading = "lazy";
+        thumbnail.draggable = false;
+        thumbnail.alt = `Run ${ref.run.id}, image ${index + 1}`;
+        thumbnail.src = imageUrl(image);
+        thumbnail.dataset.imageKey = `${image.subfolder}/${image.filename}`;
+        thumbnail.addEventListener("click", () => openModal(ref.run, index), { signal: controller.signal });
+        ref.strip.append(thumbnail);
+    }
+
+    function createRow(run) {
+        const row = document.createElement("section");
+        row.className = "gh-row";
+        row.dataset.runId = String(run.id);
+        const header = document.createElement("div");
+        header.className = "gh-header";
+        const meta = document.createElement("div");
+        meta.className = "gh-meta";
 
         const deleteButton = document.createElement("button");
         deleteButton.className = "gh-button gh-delete";
@@ -200,6 +235,7 @@ function setupNode(node) {
                     run_id: run.id,
                 });
                 state.runs = state.runs.filter((item) => item.id !== run.id);
+                state.rows.delete(runKey(run));
                 row.remove();
                 if (!state.runs.length) scroll.innerHTML = '<div class="gh-empty">No generations yet</div>';
                 updateStats();
@@ -209,29 +245,28 @@ function setupNode(node) {
         }, { signal: controller.signal });
         header.append(meta, deleteButton);
 
+        const scroller = document.createElement("div");
+        scroller.className = "gh-images-scroll";
         const strip = document.createElement("div");
         strip.className = "gh-images";
-        (run.images || []).forEach((image, index) => {
-            const thumbnail = document.createElement("img");
-            thumbnail.className = "gh-thumb";
-            thumbnail.loading = "lazy";
-            thumbnail.draggable = false;
-            thumbnail.alt = `Run ${run.id}, image ${index + 1}`;
-            thumbnail.src = imageUrl(image);
-            thumbnail.addEventListener("click", () => openModal(run, index), { signal: controller.signal });
-            strip.append(thumbnail);
-        });
-        row.append(header, strip);
-        return row;
+        scroller.append(strip);
+        const ref = { run, row, meta, scroller, strip };
+        updateHeader(ref);
+        (run.images || []).forEach((image, index) => appendThumbnail(ref, image, index));
+        row.append(header, scroller);
+        state.rows.set(runKey(run), ref);
+        requestAnimationFrame(() => updateRowSize(ref));
+        return ref;
     }
 
     function renderAll(runs) {
         state.runs = [...runs].sort((a, b) => b.id - a.id);
+        state.rows.clear();
         scroll.replaceChildren();
         if (!state.runs.length) {
             scroll.innerHTML = '<div class="gh-empty">No generations yet</div>';
         } else {
-            scroll.append(...state.runs.map(createRow));
+            scroll.append(...state.runs.map((run) => createRow(run).row));
         }
         updateStats();
     }
@@ -240,8 +275,44 @@ function setupNode(node) {
         if (state.runs.some((item) => item.id === run.id)) return;
         state.runs.unshift(run);
         scroll.querySelector(".gh-empty")?.remove();
-        scroll.prepend(createRow(run));
+        scroll.prepend(createRow(run).row);
         scroll.scrollTop = 0;
+        updateStats();
+    }
+
+    function updateRun(run, newImages = []) {
+        const ref = state.rows.get(runKey(run));
+        if (!ref) {
+            if ((run.images?.length || 0) < Number(run.image_count || 0)) {
+                loadHistory();
+                return;
+            }
+            prependRun(run);
+            return;
+        }
+        const knownImages = new Set(
+            (ref.run.images || []).map((image) => `${image.subfolder}/${image.filename}`),
+        );
+        const mergedImages = [...(ref.run.images || [])];
+        newImages.forEach((image) => {
+            const key = `${image.subfolder}/${image.filename}`;
+            if (!knownImages.has(key)) {
+                knownImages.add(key);
+                mergedImages.push(image);
+            }
+        });
+        run = { ...run, images: mergedImages };
+        const index = state.runs.findIndex((item) => runKey(item) === runKey(run));
+        if (index >= 0) state.runs[index] = run;
+        ref.run = run;
+        const existing = new Set([...ref.strip.children].map((image) => image.dataset.imageKey));
+        newImages.forEach((image) => {
+            const key = `${image.subfolder}/${image.filename}`;
+            if (!existing.has(key)) appendThumbnail(ref, image, run.images.findIndex((item) => `${item.subfolder}/${item.filename}` === key));
+        });
+        if (state.modalRun && runKey(state.modalRun) === runKey(run)) state.modalRun = run;
+        updateHeader(ref);
+        updateRowSize(ref);
         updateStats();
     }
 
@@ -315,7 +386,7 @@ function setupNode(node) {
         }
         if (payload.history_id !== historyId) return;
         state.revision += 1;
-        prependRun(payload.run);
+        updateRun(payload.run, payload.new_images || []);
     };
     api.addEventListener(EVENT_NAME, eventHandler);
 
@@ -323,15 +394,19 @@ function setupNode(node) {
         serialize: false,
         hideOnZoom: false,
         getMinHeight: () => 360,
-        getHeight: () => 420,
+        getHeight: () => "100%",
+        afterResize: () => requestAnimationFrame(updateAllRowSizes),
     });
     if (!node.size || node.size[0] < 500 || node.size[1] < 500) {
         node.setSize?.([Math.max(node.size?.[0] || 0, 700), Math.max(node.size?.[1] || 0, 500)]);
     }
 
     const previousRemoved = node.onRemoved;
+    const resizeObserver = new ResizeObserver(() => updateAllRowSizes());
+    resizeObserver.observe(root);
     node.onRemoved = function () {
         api.removeEventListener(EVENT_NAME, eventHandler);
+        resizeObserver.disconnect();
         controller.abort();
         modal.remove();
         previousRemoved?.apply(this, arguments);

@@ -8,6 +8,7 @@ from typing import Any, Iterable
 
 from aiohttp import web
 import folder_paths
+from comfy_execution.utils import get_executing_context
 from server import PromptServer
 
 from .storage import HistoryStorage
@@ -20,7 +21,7 @@ STORAGE = HistoryStorage(
 )
 
 SEED_KEYS = ("seed", "noise_seed")
-MODEL_KEYS = ("ckpt_name", "unet_name", "model_name", "checkpoint_name")
+MODEL_KEYS = ("unet_name", "ckpt_name", "model_name", "checkpoint_name")
 
 
 def _is_link(value: Any, prompt: dict[str, Any]) -> bool:
@@ -75,7 +76,7 @@ def extract_metadata(prompt: Any, unique_id: Any) -> dict[str, Any]:
         return {"seed": "Unknown", "model": "Unknown", "loras": []}
 
     seed: Any = None
-    model: Any = None
+    model_candidates: list[tuple[int, Any]] = []
     loras: list[dict[str, Any]] = []
     seen_loras: set[tuple[str, Any]] = set()
 
@@ -91,12 +92,21 @@ def extract_metadata(prompt: Any, unique_id: Any) -> dict[str, Any]:
                     seed = value
                     break
 
-        if model is None:
-            for key in MODEL_KEYS:
-                value = _plain_value(inputs.get(key), prompt)
-                if value not in (None, ""):
-                    model = value
-                    break
+        class_type = str(node.get("class_type", "")).lower()
+        for key in MODEL_KEYS:
+            value = _plain_value(inputs.get(key), prompt)
+            if value in (None, ""):
+                continue
+            priority = 2
+            if (
+                key == "unet_name"
+                or "unetloader" in class_type
+                or "diffusionmodelload" in class_type
+            ):
+                priority = 0
+            elif key == "ckpt_name" or "checkpointloader" in class_type:
+                priority = 1
+            model_candidates.append((priority, value))
 
         lora_name = _plain_value(inputs.get("lora_name"), prompt)
         if lora_name not in (None, ""):
@@ -110,7 +120,11 @@ def extract_metadata(prompt: Any, unique_id: Any) -> dict[str, Any]:
 
     return {
         "seed": seed if seed is not None else "Unknown",
-        "model": str(model) if model not in (None, "") else "Unknown",
+        "model": (
+            str(min(model_candidates, key=lambda item: item[0])[1])
+            if model_candidates
+            else "Unknown"
+        ),
         "loras": loras,
     }
 
@@ -123,6 +137,18 @@ def _seed_override(value: str, automatic: Any) -> Any:
         return int(value)
     except ValueError:
         return value
+
+
+def current_execution_id() -> str:
+    context = get_executing_context()
+    prompt_id = getattr(context, "prompt_id", None)
+    if prompt_id not in (None, ""):
+        return str(prompt_id)
+    LOGGER.warning(
+        "[GenerationHistory] ComfyUI execution context unavailable; "
+        "this invocation cannot be grouped"
+    )
+    return f"fallback:{uuid.uuid4()}"
 
 
 routes = PromptServer.instance.routes
@@ -230,7 +256,7 @@ class GenerationHistory:
     FUNCTION = "record"
     CATEGORY = "image/history"
     OUTPUT_NODE = True
-    DESCRIPTION = "Keeps each executed image batch as one comparable history row."
+    DESCRIPTION = "Keeps each queued execution as one comparable history row."
 
     @classmethod
     def IS_CHANGED(cls, **_kwargs: Any) -> float:
@@ -259,8 +285,10 @@ class GenerationHistory:
             metadata = extract_metadata(prompt, unique_id)
             seed = _seed_override(seed_override, metadata["seed"])
             model = str(model_override or "").strip() or metadata["model"]
-            run = STORAGE.add_run(
+            execution_id = current_execution_id()
+            run, new_images, created = STORAGE.append_images(
                 history_id,
+                execution_id,
                 images,
                 persist=bool(persist_history),
                 timestamp=datetime.now().astimezone().isoformat(timespec="seconds"),
@@ -273,12 +301,24 @@ class GenerationHistory:
                 "history_id": history_id,
                 "node_id": str(unique_id),
                 "persist": bool(persist_history),
-                "run": run,
+                "execution_id": execution_id,
+                "run_id": run["id"],
+                "is_new": created,
+                "new_images": new_images,
+                "image_count": run["image_count"],
+                "metadata": {
+                    "model": run["model"],
+                    "seeds": run["seeds"],
+                    "loras": run["loras"],
+                },
+                "run": {**run, "images": new_images},
             }
             PromptServer.instance.send_sync(EVENT_NAME, payload)
             LOGGER.info(
-                "[GenerationHistory] Created run #%s with %s images",
+                "[GenerationHistory] %s run #%s: +%s images (%s total)",
+                "Created" if created else "Updated",
                 run["id"],
+                len(new_images),
                 run["image_count"],
             )
         except Exception as exc:

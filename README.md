@@ -1,15 +1,17 @@
 # ComfyUI Generation History
 
 `Generation History` is a ComfyUI image pass-through node that keeps every
-executed batch as one comparison row. A 20-image batch is one run with 20
-non-wrapping thumbnails; the next execution adds a new row above it.
+queued workflow execution as one comparison row. A normal 20-image batch and
+20 sequential one-image invocations both produce one run with 20 non-wrapping
+thumbnails; the next Queue Prompt adds a new row above it.
 
 ## Features
 
-- One workflow execution = one run; one input batch = one horizontal row.
+- One Queue Prompt = one run, across normal batches and sequential/list calls.
 - Newest run first, vertical history scroll, independent horizontal row scroll.
 - Full-resolution lightbox with close, `Esc`, previous and next controls.
-- Automatic best-effort seed, checkpoint/UNet and LoRA metadata detection.
+- Automatic best-effort seed, UNet/checkpoint and LoRA metadata detection.
+- Responsive rows, headers and thumbnails that follow live node resizing.
 - Optional seed/model overrides and run label under the node's advanced inputs.
 - Per-run delete and per-node Clear with confirmation.
 - No run count, image count, LRU or age-based automatic deletion.
@@ -19,9 +21,10 @@ non-wrapping thumbnails; the next execution adds a new row above it.
 
 The implementation uses the currently supported ComfyUI custom-node APIs:
 `INPUT_TYPES`, hidden `PROMPT`/`EXTRA_PNGINFO`/`UNIQUE_ID`, `WEB_DIRECTORY`,
-`app.registerExtension`, `addDOMWidget`, `PromptServer` events and custom
-routes. The V1 schema remains fully supported by current ComfyUI and gives this
-node wider installation compatibility than requiring the newer V3 schema.
+`app.registerExtension`, `addDOMWidget`, `PromptServer` events, custom routes
+and the current execution context's `prompt_id`. The V1 schema remains fully
+supported by current ComfyUI and gives this node wider installation
+compatibility than requiring the newer V3 schema.
 
 ## Installation
 
@@ -78,7 +81,8 @@ means queuing the same workflow twice records two distinct runs.
 
 Inputs:
 
-- `images`: the complete ComfyUI `IMAGE` batch.
+- `images`: the `IMAGE` batch received in the current invocation. Repeated
+  invocations from the same Queue Prompt are appended to the same run.
 - `persist_history`: stores new runs permanently when enabled.
 - Advanced `seed_override`: blank uses automatic detection.
 - Advanced `model_override`: blank uses automatic detection.
@@ -106,11 +110,14 @@ output/generation_history/<history-uuid>/
 `manifest.json` is written through a flushed temporary file and atomically
 replaced. A corrupt manifest is preserved as `manifest.corrupt-*.json`; it does
 not prevent ComfyUI from starting. Run allocation, delete and clear operations
-are locked per history UUID.
+are locked per history UUID. Manifest version 2 records the execution ID, all
+distinct seeds and the stable index of every image. Version 1 histories are
+read and migrated without deleting their images.
 
 With persistence disabled, full-resolution PNGs are placed in ComfyUI's temp
-directory and the manifest exists only in the current Python process. Browser
-or ComfyUI restarts are therefore allowed to start with an empty gallery.
+directory and the manifest exists only in the current Python process. A browser
+reload can restore that session history, while a ComfyUI restart starts with an
+empty non-persistent gallery.
 
 Changing OFF → ON does not retroactively copy session rows; only later runs are
 persisted. Changing ON → OFF does not delete existing output files. Rows already
@@ -121,15 +128,16 @@ or Clear.
 ## Metadata detection
 
 The node walks only upstream prompt links, breadth-first. It recognizes common
-`seed`/`noise_seed`, `ckpt_name`/`unet_name`/`model_name`, `lora_name` and
-`strength_model` fields. Custom nodes with different field names remain usable;
-their unavailable values display as `Unknown`. Overrides take precedence over
-automatic values.
+`seed`/`noise_seed`, `unet_name`/`ckpt_name`/`model_name`, `lora_name` and
+`strength_model` fields. A UNet/diffusion loader takes precedence over a
+checkpoint or generic model field; a CLIP loader is not mistaken for the main
+model. Custom nodes with different field names remain usable; their unavailable
+values display as `Unknown`. Overrides take precedence over automatic values.
 
 ## Manual acceptance checks
 
-1. Queue batches of 10, 10 and 20 images. Confirm rows `#3`, `#2`, `#1`, with
-   20 thumbnails on one horizontally scrollable row.
+1. Queue batches of 10, 10 and 20 images in three Queue Prompts. Confirm rows
+   `#3`, `#2`, `#1`, with 20 thumbnails on one horizontal strip.
 2. Queue 30 runs. Confirm vertical scrolling and that no row disappears.
 3. Open a thumbnail. Confirm full-resolution display, `Esc`, `×`, backdrop
    close and arrow navigation.
@@ -140,6 +148,10 @@ automatic values.
    runs return newest-first and numbering continues.
 7. Queue an unchanged workflow twice. Confirm two new rows are created.
 8. Duplicate the node. Confirm each node receives only its own later runs.
+9. Use a sequential/list workflow with six one-image invocations. Confirm one
+   run with six images in arrival order.
+10. Resize the node between 500, 1000 and 1400 px. Confirm the gallery, header
+    and thumbnail sizing update immediately.
 
 ## Troubleshooting
 
