@@ -8,13 +8,14 @@ with normal image batches and sequential/list executions.
 
 - **images**: Image batch to display and pass through unchanged.
 - **persist_history**: Save the gallery and full-resolution PNG files below
-  `output/generation_history`. When disabled, history lasts only for the current
-  ComfyUI server session.
+  `output/generation_history`. When disabled, opening or reloading the workflow
+  starts an empty temporary gallery. Persistence is applied per run; saved rows
+  display a `SAVED` badge while technical identifiers remain hidden.
 - **seed_override**: Optional seed shown instead of automatically detected seed
   metadata.
 - **model_override**: Optional model name shown instead of the detected UNet or
   checkpoint name.
-- **run_label**: Optional label displayed beside the run number.
+- **run_label**: Optional title displayed at the start of the row.
 
 ## Usage
 
@@ -26,6 +27,8 @@ VAE Decode → Generation History → Save Image
 
 The newest run appears first. Scroll vertically between runs and horizontally
 through images in a run. Select a thumbnail to open the full-resolution image.
+Enabling persistence loads previously saved rows immediately; it does not save
+temporary rows retroactively.
 
 Use the delete button on a run to remove that run, or **Clear** to remove all
 history belonging to this node. Persistent history has no automatic size limit.

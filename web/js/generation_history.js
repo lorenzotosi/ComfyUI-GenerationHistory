@@ -63,7 +63,8 @@ function injectStyles() {
         .gh-row { box-sizing:border-box; width:100%; min-width:0; margin:0 0 8px; padding:6px; border:1px solid var(--border-color, rgba(128,128,128,.32)); border-radius:6px; background:rgba(127,127,127,.08); }
         .gh-header { box-sizing:border-box; width:100%; min-width:0; display:flex; align-items:flex-start; gap:7px; margin-bottom:5px; min-height:20px; }
         .gh-meta { flex:1 1 auto; min-width:0; white-space:normal; overflow-wrap:anywhere; line-height:1.35; }
-        .gh-run { font-weight:700; }
+        .gh-label { font-weight:700; }
+        .gh-saved { display:inline-block; margin-left:6px; padding:1px 5px; border:1px solid rgba(129,199,132,.7); border-radius:4px; color:#a5d6a7; background:rgba(46,125,50,.22); font-size:10px; font-weight:700; letter-spacing:.04em; vertical-align:1px; }
         .gh-delete { margin-left:auto; flex:0 0 auto; width:24px; padding:1px 5px; font-size:15px; line-height:18px; color:#ef9a9a; }
         .gh-images-scroll { box-sizing:border-box; width:100%; min-width:0; overflow-x:auto; overflow-y:hidden; padding-bottom:4px; overscroll-behavior-x:contain; }
         .gh-images { display:flex; flex-flow:row nowrap; gap:6px; width:max-content; }
@@ -112,6 +113,8 @@ function setupNode(node) {
 
     const controller = new AbortController();
     const state = { runs: [], rows: new Map(), revision: 0, modalRun: null, modalIndex: 0 };
+    let initializedHistoryId = null;
+    let initializationPromise = null;
     const root = document.createElement("div");
     root.className = "gh-root";
     root.innerHTML = `
@@ -188,18 +191,29 @@ function setupNode(node) {
         const loras = (run.loras || []).map((lora) =>
             `${lora.name}${lora.strength_model == null ? "" : ` @ ${lora.strength_model}`}`,
         );
-        const parts = [
-            `Run #${run.id}${run.label ? ` · ${run.label}` : ""}`,
+        const details = [
             `${seedLabel}: ${seeds.join(", ")}`,
             `Model: ${run.model || "Unknown"}`,
             `${run.image_count ?? run.images?.length ?? 0} images`,
             formatTimestamp(run.timestamp),
         ];
-        if (loras.length) parts.splice(3, 0, `LoRA: ${loras.join(", ")}`);
-        const runTitle = document.createElement("span");
-        runTitle.className = "gh-run";
-        runTitle.textContent = parts.shift();
-        meta.replaceChildren(runTitle, document.createTextNode(` · ${parts.filter(Boolean).join(" · ")}`));
+        if (loras.length) details.splice(2, 0, `LoRA: ${loras.join(", ")}`);
+        const content = [];
+        if (run.label) {
+            const label = document.createElement("span");
+            label.className = "gh-label";
+            label.textContent = run.label;
+            content.push(label);
+        }
+        if (run.persistent) {
+            const saved = document.createElement("span");
+            saved.className = "gh-saved";
+            saved.textContent = "SAVED";
+            saved.title = "This run is stored in the ComfyUI output directory";
+            content.push(saved);
+        }
+        content.push(document.createTextNode(`${content.length ? " · " : ""}${details.filter(Boolean).join(" · ")}`));
+        meta.replaceChildren(...content);
         meta.title = meta.textContent;
     }
 
@@ -208,7 +222,7 @@ function setupNode(node) {
         thumbnail.className = "gh-thumb";
         thumbnail.loading = "lazy";
         thumbnail.draggable = false;
-        thumbnail.alt = `Run ${ref.run.id}, image ${index + 1}`;
+        thumbnail.alt = `Generation image ${index + 1}`;
         thumbnail.src = imageUrl(image);
         thumbnail.dataset.imageKey = `${image.subfolder}/${image.filename}`;
         thumbnail.addEventListener("click", () => openModal(ref.run, index), { signal: controller.signal });
@@ -228,14 +242,15 @@ function setupNode(node) {
         deleteButton.className = "gh-button gh-delete";
         deleteButton.type = "button";
         deleteButton.textContent = "×";
-        deleteButton.title = `Delete Run #${run.id}`;
+        deleteButton.title = "Delete generation";
         deleteButton.addEventListener("click", async () => {
             try {
                 await jsonRequest("/generation-history/delete-run", {
                     history_id: getWidget(node, "history_id")?.value,
                     run_id: run.id,
+                    persistent: Boolean(run.persistent),
                 });
-                state.runs = state.runs.filter((item) => item.id !== run.id);
+                state.runs = state.runs.filter((item) => runKey(item) !== runKey(run));
                 state.rows.delete(runKey(run));
                 row.remove();
                 if (!state.runs.length) scroll.innerHTML = '<div class="gh-empty">No generations yet</div>';
@@ -261,7 +276,9 @@ function setupNode(node) {
     }
 
     function renderAll(runs) {
-        state.runs = [...runs].sort((a, b) => b.id - a.id);
+        state.runs = [...runs].sort((a, b) =>
+            (b.id - a.id) || (new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()),
+        );
         state.rows.clear();
         scroll.replaceChildren();
         if (!state.runs.length) {
@@ -273,7 +290,7 @@ function setupNode(node) {
     }
 
     function prependRun(run) {
-        if (state.runs.some((item) => item.id === run.id)) return;
+        if (state.runs.some((item) => runKey(item) === runKey(run))) return;
         state.runs.unshift(run);
         scroll.querySelector(".gh-empty")?.remove();
         scroll.prepend(createRow(run).row);
@@ -285,7 +302,7 @@ function setupNode(node) {
         const ref = state.rows.get(runKey(run));
         if (!ref) {
             if ((run.images?.length || 0) < Number(run.image_count || 0)) {
-                loadHistory();
+                loadHistory(true);
                 return;
             }
             prependRun(run);
@@ -317,7 +334,7 @@ function setupNode(node) {
         updateStats();
     }
 
-    async function loadHistory() {
+    async function loadHistory(mergeCurrent = false) {
         const historyId = String(getWidget(node, "history_id")?.value || "");
         if (!UUID_RE.test(historyId)) return;
         const persist = Boolean(getWidget(node, "persist_history")?.value);
@@ -326,17 +343,54 @@ function setupNode(node) {
             const response = await api.fetchApi(`/generation-history/history?id=${encodeURIComponent(historyId)}&persist=${persist ? 1 : 0}`);
             const data = await response.json();
             if (!response.ok) throw new Error(data.error || response.statusText);
-            if (revision === state.revision) {
+            if (!mergeCurrent && revision === state.revision) {
                 renderAll(data.runs || []);
             } else {
-                const merged = new Map((data.runs || []).map((run) => [run.id, run]));
-                state.runs.forEach((run) => merged.set(run.id, run));
+                const merged = new Map((data.runs || []).map((run) => [runKey(run), run]));
+                state.runs.forEach((run) => merged.set(runKey(run), run));
                 renderAll([...merged.values()]);
             }
         } catch (error) {
             scroll.innerHTML = `<div class="gh-error"></div>`;
             scroll.firstElementChild.textContent = `Unable to load history: ${error.message}`;
         }
+    }
+
+    function initializeHistory(force = false) {
+        const historyId = String(getWidget(node, "history_id")?.value || "");
+        if (!UUID_RE.test(historyId)) return Promise.resolve();
+        if (!force && initializedHistoryId === historyId && initializationPromise) {
+            return initializationPromise;
+        }
+
+        initializedHistoryId = historyId;
+        initializationPromise = (async () => {
+            const persist = Boolean(getWidget(node, "persist_history")?.value);
+            if (!persist) {
+                await jsonRequest("/generation-history/reset-volatile", {
+                    history_id: historyId,
+                });
+                state.revision = 0;
+                renderAll([]);
+            }
+            await loadHistory();
+        })().catch((error) => {
+            scroll.innerHTML = '<div class="gh-error"></div>';
+            scroll.firstElementChild.textContent = `Unable to initialize history: ${error.message}`;
+        });
+        return initializationPromise;
+    }
+
+    const persistWidget = getWidget(node, "persist_history");
+    const previousPersistCallback = persistWidget?.callback;
+    if (persistWidget) {
+        persistWidget.callback = function () {
+            const result = previousPersistCallback?.apply(this, arguments);
+            if (Boolean(persistWidget.value)) {
+                queueMicrotask(() => loadHistory(true));
+            }
+            return result;
+        };
     }
 
     root.querySelector(".gh-clear").addEventListener("click", async () => {
@@ -410,6 +464,7 @@ function setupNode(node) {
         resizeObserver.disconnect();
         controller.abort();
         modal.remove();
+        if (persistWidget) persistWidget.callback = previousPersistCallback;
         previousRemoved?.apply(this, arguments);
     };
     const previousAdded = node.onAdded;
@@ -417,15 +472,15 @@ function setupNode(node) {
         const result = previousAdded?.apply(this, arguments);
         queueMicrotask(() => {
             ensureUniqueHistoryId(node);
-            loadHistory();
+            initializeHistory();
         });
         return result;
     };
 
-    node._generationHistory = { reload: loadHistory };
+    node._generationHistory = { reload: () => initializeHistory(true) };
     queueMicrotask(() => {
         ensureUniqueHistoryId(node);
-        loadHistory();
+        initializeHistory();
     });
 }
 

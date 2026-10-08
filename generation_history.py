@@ -179,11 +179,35 @@ async def _request_json(request: web.Request) -> dict[str, Any]:
     return data
 
 
+@routes.post("/generation-history/reset-volatile")
+async def reset_volatile_generation_history(request: web.Request) -> web.Response:
+    try:
+        data = await _request_json(request)
+        removed = STORAGE.reset_volatile(data.get("history_id", ""))
+        LOGGER.info(
+            "[GenerationHistory] Reset volatile history (%s runs removed)",
+            removed,
+        )
+        return web.json_response({"ok": True, "removed": removed})
+    except (ValueError, web.HTTPBadRequest) as exc:
+        return web.json_response({"error": str(exc)}, status=400)
+    except OSError as exc:
+        LOGGER.exception("[GenerationHistory] Unable to reset volatile history")
+        return web.json_response({"error": str(exc)}, status=500)
+
+
 @routes.post("/generation-history/delete-run")
 async def delete_generation_history_run(request: web.Request) -> web.Response:
     try:
         data = await _request_json(request)
-        deleted = STORAGE.delete_run(data.get("history_id", ""), data.get("run_id"))
+        persistent = data.get("persistent")
+        if persistent is not None and not isinstance(persistent, bool):
+            raise ValueError("persistent must be a boolean")
+        deleted = STORAGE.delete_run(
+            data.get("history_id", ""),
+            data.get("run_id"),
+            persistent=persistent,
+        )
         if not deleted:
             return web.json_response({"error": "run not found"}, status=404)
         LOGGER.info("[GenerationHistory] Deleted run #%s", data.get("run_id"))

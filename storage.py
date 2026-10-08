@@ -121,6 +121,7 @@ class HistoryStorage:
         return {
             "id": run_id,
             "execution_id": str(run.get("execution_id") or f"legacy:{run_id}"),
+            "persistent": True,
             "timestamp": str(run.get("timestamp", "")),
             "seeds": seeds,
             "model": str(run.get("model") or "Unknown"),
@@ -220,35 +221,28 @@ class HistoryStorage:
             raise ValueError("images batch is empty")
 
         with self._lock_for(history_id):
-            persistent = self._load_persistent_unlocked(history_id)
             volatile = self._volatile.setdefault(
                 history_id, self._empty_manifest(history_id)
             )
+            persistent = self._load_persistent_unlocked(history_id) if persist else None
+            target = persistent if persistent is not None else volatile
+            target_persist = persist
             run = next(
                 (
                     item
-                    for item in persistent["runs"]
+                    for item in target["runs"]
                     if item["execution_id"] == execution_id
                 ),
                 None,
             )
-            target = persistent
-            target_persist = True
-            if run is None:
-                run = next(
-                    (
-                        item
-                        for item in volatile["runs"]
-                        if item["execution_id"] == execution_id
-                    ),
-                    None,
-                )
-                target = volatile
-                target_persist = False
 
             created = run is None
             if created:
-                run_id = max(persistent["next_run_id"], volatile["next_run_id"])
+                run_id = (
+                    max(target["next_run_id"], volatile["next_run_id"])
+                    if target_persist
+                    else volatile["next_run_id"]
+                )
                 base_dir = (
                     self._persistent_dir(history_id)
                     if persist
@@ -256,11 +250,10 @@ class HistoryStorage:
                 )
                 while (base_dir / f"run_{run_id:06d}").exists():
                     run_id += 1
-                target = persistent if persist else volatile
-                target_persist = persist
                 run = {
                     "id": run_id,
                     "execution_id": execution_id,
+                    "persistent": target_persist,
                     "timestamp": timestamp,
                     "seeds": [],
                     "model": model or "Unknown",
@@ -339,7 +332,9 @@ class HistoryStorage:
             if created:
                 target["runs"].insert(0, run)
                 target["next_run_id"] = run["id"] + 1
-                volatile["next_run_id"] = max(volatile["next_run_id"], run["id"] + 1)
+            volatile["next_run_id"] = max(
+                volatile["next_run_id"], run["id"] + 1
+            )
             if target_persist:
                 self._atomic_write(
                     self._persistent_dir(history_id) / "manifest.json", target
@@ -355,34 +350,53 @@ class HistoryStorage:
                 self._volatile.get(history_id, self._empty_manifest(history_id))
             )
 
-    def delete_run(self, history_id: str, run_id: Any) -> bool:
+    def reset_volatile(self, history_id: str) -> int:
+        history_id = self.validate_history_id(history_id)
+        with self._lock_for(history_id):
+            current = self._volatile.get(history_id)
+            removed = len(current["runs"]) if current is not None else 0
+            volatile_dir = self._volatile_dir(history_id)
+            if volatile_dir.is_dir():
+                shutil.rmtree(volatile_dir, ignore_errors=True)
+            self._volatile[history_id] = self._empty_manifest(history_id)
+            return removed
+
+    def delete_run(
+        self,
+        history_id: str,
+        run_id: Any,
+        *,
+        persistent: bool | None = None,
+    ) -> bool:
         history_id = self.validate_history_id(history_id)
         run_id = self.validate_run_id(run_id)
         found = False
         with self._lock_for(history_id):
-            persistent = self._load_persistent_unlocked(history_id)
-            kept = [run for run in persistent["runs"] if run["id"] != run_id]
-            if len(kept) != len(persistent["runs"]):
-                persistent["runs"] = kept
-                self._atomic_write(
-                    self._persistent_dir(history_id) / "manifest.json", persistent
-                )
-                shutil.rmtree(
-                    self._persistent_dir(history_id) / f"run_{run_id:06d}",
-                    ignore_errors=True,
-                )
-                found = True
-
-            volatile = self._volatile.get(history_id)
-            if volatile is not None:
-                kept = [run for run in volatile["runs"] if run["id"] != run_id]
-                if len(kept) != len(volatile["runs"]):
-                    volatile["runs"] = kept
+            if persistent is not False:
+                saved = self._load_persistent_unlocked(history_id)
+                kept = [run for run in saved["runs"] if run["id"] != run_id]
+                if len(kept) != len(saved["runs"]):
+                    saved["runs"] = kept
+                    self._atomic_write(
+                        self._persistent_dir(history_id) / "manifest.json", saved
+                    )
                     shutil.rmtree(
-                        self._volatile_dir(history_id) / f"run_{run_id:06d}",
+                        self._persistent_dir(history_id) / f"run_{run_id:06d}",
                         ignore_errors=True,
                     )
                     found = True
+
+            if persistent is not True:
+                volatile = self._volatile.get(history_id)
+                if volatile is not None:
+                    kept = [run for run in volatile["runs"] if run["id"] != run_id]
+                    if len(kept) != len(volatile["runs"]):
+                        volatile["runs"] = kept
+                        shutil.rmtree(
+                            self._volatile_dir(history_id) / f"run_{run_id:06d}",
+                            ignore_errors=True,
+                        )
+                        found = True
         return found
 
     def clear(self, history_id: str) -> int:

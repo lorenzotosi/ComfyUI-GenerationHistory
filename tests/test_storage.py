@@ -170,6 +170,122 @@ class HistoryStorageTests(unittest.TestCase):
         history = self.storage.get_history(self.history_id, persist=False)
         self.assertEqual(history["runs"][0]["image_count"], 2)
 
+    def test_volatile_history_resets_to_run_one_independently(self):
+        persistent = self.add(persist=True, execution_id="persistent-prompt")[0]
+        self.storage.reset_volatile(self.history_id)
+        volatile = self.add(persist=False, execution_id="volatile-prompt")[0]
+        self.assertEqual((persistent["id"], volatile["id"]), (1, 1))
+        self.assertTrue(persistent["persistent"])
+        self.assertFalse(volatile["persistent"])
+
+        volatile_dir = self.storage._volatile_dir(self.history_id)
+        self.assertTrue((volatile_dir / "run_000001" / "image_000.png").is_file())
+        self.assertEqual(self.storage.reset_volatile(self.history_id), 1)
+        self.assertFalse(volatile_dir.exists())
+
+        reset = self.storage.get_history(self.history_id, persist=False)
+        self.assertEqual(reset["runs"], [])
+        self.assertEqual(reset["next_run_id"], 1)
+        self.assertEqual(
+            self.add(persist=False, execution_id="new-session-prompt")[0]["id"],
+            1,
+        )
+
+        persisted = self.storage.get_history(self.history_id, persist=True)
+        self.assertEqual([run["id"] for run in persisted["runs"]], [1])
+
+    def test_mixed_persistence_keeps_session_numbers_and_saved_run_identity(self):
+        runs = [
+            self.add(persist=False, execution_id="prompt-1")[0],
+            self.add(persist=False, execution_id="prompt-2")[0],
+            self.add(persist=True, execution_id="prompt-3")[0],
+            self.add(persist=False, execution_id="prompt-4")[0],
+            self.add(persist=False, execution_id="prompt-5")[0],
+        ]
+        self.assertEqual([run["id"] for run in runs], [1, 2, 3, 4, 5])
+        self.assertEqual(
+            [run["persistent"] for run in runs],
+            [False, False, True, False, False],
+        )
+
+        saved = self.storage.get_history(self.history_id, persist=True)
+        temporary = self.storage.get_history(self.history_id, persist=False)
+        self.assertEqual([run["id"] for run in saved["runs"]], [3])
+        self.assertEqual([run["id"] for run in temporary["runs"]], [5, 4, 2, 1])
+
+        restarted = HistoryStorage(self.output, self.temp)
+        restarted._save_png = lambda _image, path: path.write_bytes(b"png")
+        restarted.reset_volatile(self.history_id)
+        first_temporary, _, _ = restarted.append_images(
+            self.history_id,
+            "new-session-temporary",
+            [self.image],
+            persist=False,
+            timestamp="2026-10-08T13:00:00+02:00",
+            seed=123,
+            model="model.safetensors",
+            loras=[],
+            label="",
+        )
+        self.assertEqual(first_temporary["id"], 1)
+        self.assertEqual(
+            [run["id"] for run in restarted.get_history(self.history_id, persist=True)["runs"]],
+            [3],
+        )
+
+        loaded_saved_first = HistoryStorage(self.output, self.temp)
+        loaded_saved_first._save_png = lambda _image, path: path.write_bytes(b"png")
+        self.assertEqual(
+            [
+                run["id"]
+                for run in loaded_saved_first.get_history(
+                    self.history_id, persist=True
+                )["runs"]
+            ],
+            [3],
+        )
+        temporary_after_loading_saved, _, _ = loaded_saved_first.append_images(
+            self.history_id,
+            "temporary-after-loading-saved",
+            [self.image],
+            persist=False,
+            timestamp="2026-10-08T13:01:00+02:00",
+            seed=123,
+            model="model.safetensors",
+            loras=[],
+            label="",
+        )
+        self.assertEqual(temporary_after_loading_saved["id"], 1)
+
+    def test_delete_targets_saved_or_temporary_run_when_ids_overlap(self):
+        self.add(persist=True, execution_id="saved")[0]
+        self.storage.reset_volatile(self.history_id)
+        self.add(persist=False, execution_id="temporary")[0]
+
+        self.assertTrue(
+            self.storage.delete_run(self.history_id, 1, persistent=False)
+        )
+        self.assertEqual(
+            [run["id"] for run in self.storage.get_history(self.history_id, persist=True)["runs"]],
+            [1],
+        )
+        self.assertEqual(
+            self.storage.get_history(self.history_id, persist=False)["runs"], []
+        )
+
+        self.storage.reset_volatile(self.history_id)
+        self.add(persist=False, execution_id="temporary-again")[0]
+        self.assertTrue(
+            self.storage.delete_run(self.history_id, 1, persistent=True)
+        )
+        self.assertEqual(
+            self.storage.get_history(self.history_id, persist=True)["runs"], []
+        )
+        self.assertEqual(
+            [run["id"] for run in self.storage.get_history(self.history_id, persist=False)["runs"]],
+            [1],
+        )
+
     def test_rejects_untrusted_identifiers(self):
         with self.assertRaises(ValueError):
             self.storage.get_history("../../output", persist=True)
