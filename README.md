@@ -25,7 +25,7 @@ node wider installation compatibility than requiring the newer V3 schema.
 
 ## Installation
 
-Clone the public repository inside `custom_nodes`:
+Clone the repository inside `custom_nodes`:
 
 ```bash
 cd ComfyUI/custom_nodes
