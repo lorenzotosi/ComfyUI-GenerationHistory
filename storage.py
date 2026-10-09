@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-import json
-import logging
 import os
-import re
 import shutil
 import threading
 import uuid
@@ -12,19 +9,13 @@ from pathlib import Path
 from typing import Any
 
 
-LOGGER = logging.getLogger(__name__)
-RUN_DIR_RE = re.compile(r"^run_(\d{6,})$")
-IMAGE_FILE_RE = re.compile(r"^image_(\d{3,})\.png$")
-
-
 class HistoryStorage:
-    """Thread-safe storage for persistent and current-process histories."""
+    """Thread-safe storage for the current ComfyUI session."""
 
-    def __init__(self, output_dir: str | Path, temp_dir: str | Path) -> None:
-        self.output_root = Path(output_dir) / "generation_history"
+    def __init__(self, temp_dir: str | Path) -> None:
         self.session_name = f"session_{uuid.uuid4().hex}"
         self.temp_root = Path(temp_dir) / "generation_history" / self.session_name
-        self._volatile: dict[str, dict[str, Any]] = {}
+        self._histories: dict[str, dict[str, Any]] = {}
         self._locks: dict[str, threading.RLock] = {}
         self._locks_guard = threading.Lock()
 
@@ -52,140 +43,15 @@ class HistoryStorage:
             return self._locks.setdefault(history_id, threading.RLock())
 
     @staticmethod
-    def _empty_manifest(history_id: str, next_run_id: int = 1) -> dict[str, Any]:
+    def _empty_history(history_id: str, next_run_id: int = 1) -> dict[str, Any]:
         return {
-            "version": 2,
             "history_id": history_id,
             "next_run_id": max(1, int(next_run_id)),
             "runs": [],
         }
 
-    def _persistent_dir(self, history_id: str) -> Path:
-        return self.output_root / history_id
-
-    def _volatile_dir(self, history_id: str) -> Path:
+    def _history_dir(self, history_id: str) -> Path:
         return self.temp_root / history_id
-
-    @staticmethod
-    def _scan_next_run_id(history_dir: Path) -> int:
-        highest = 0
-        if history_dir.is_dir():
-            for child in history_dir.iterdir():
-                match = RUN_DIR_RE.fullmatch(child.name)
-                if child.is_dir() and match:
-                    highest = max(highest, int(match.group(1)))
-        return highest + 1
-
-    def _normalise_run(self, history_id: str, run: Any) -> dict[str, Any] | None:
-        if not isinstance(run, dict):
-            return None
-        try:
-            run_id = self.validate_run_id(run.get("id"))
-        except ValueError:
-            return None
-
-        expected_subfolder = f"generation_history/{history_id}/run_{run_id:06d}"
-        images = []
-        for image in run.get("images", []):
-            if not isinstance(image, dict):
-                continue
-            filename = str(image.get("filename", ""))
-            match = IMAGE_FILE_RE.fullmatch(filename)
-            if match:
-                images.append(
-                    {
-                        "filename": filename,
-                        "subfolder": expected_subfolder,
-                        "type": "output",
-                        "index": int(match.group(1)),
-                        "seed": image.get("seed", run.get("seed", "Unknown")),
-                    }
-                )
-        images.sort(key=lambda item: item["index"])
-
-        loras = []
-        for lora in run.get("loras", []):
-            if isinstance(lora, dict) and lora.get("name"):
-                loras.append(
-                    {
-                        "name": str(lora["name"]),
-                        "strength_model": lora.get("strength_model"),
-                    }
-                )
-
-        seeds = run.get("seeds")
-        if not isinstance(seeds, list):
-            seeds = [run.get("seed", "Unknown")]
-        seeds = list(dict.fromkeys(seed for seed in seeds if seed != "Unknown"))
-
-        return {
-            "id": run_id,
-            "execution_id": str(run.get("execution_id") or f"legacy:{run_id}"),
-            "persistent": True,
-            "timestamp": str(run.get("timestamp", "")),
-            "seeds": seeds,
-            "model": str(run.get("model") or "Unknown"),
-            "label": str(run.get("label") or ""),
-            "loras": loras,
-            "image_count": len(images),
-            "images": images,
-        }
-
-    def _load_persistent_unlocked(self, history_id: str) -> dict[str, Any]:
-        history_dir = self._persistent_dir(history_id)
-        manifest_path = history_dir / "manifest.json"
-        if not manifest_path.exists():
-            return self._empty_manifest(history_id, self._scan_next_run_id(history_dir))
-
-        try:
-            with manifest_path.open("r", encoding="utf-8") as handle:
-                raw = json.load(handle)
-            if not isinstance(raw, dict) or raw.get("history_id") != history_id:
-                raise ValueError("manifest identity does not match its directory")
-            runs = [
-                normalised
-                for item in raw.get("runs", [])
-                if (normalised := self._normalise_run(history_id, item)) is not None
-            ]
-            runs.sort(key=lambda item: item["id"], reverse=True)
-            next_run_id = max(
-                int(raw.get("next_run_id", 1)),
-                max((item["id"] for item in runs), default=0) + 1,
-                self._scan_next_run_id(history_dir),
-            )
-            return {
-                "version": 2,
-                "history_id": history_id,
-                "next_run_id": next_run_id,
-                "runs": runs,
-            }
-        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
-            backup = manifest_path.with_name(
-                f"manifest.corrupt-{uuid.uuid4().hex[:8]}.json"
-            )
-            try:
-                os.replace(manifest_path, backup)
-                LOGGER.error(
-                    "[GenerationHistory] Corrupt manifest preserved as %s: %s",
-                    backup,
-                    exc,
-                )
-            except OSError:
-                LOGGER.exception("[GenerationHistory] Unable to preserve corrupt manifest")
-            return self._empty_manifest(history_id, self._scan_next_run_id(history_dir))
-
-    @staticmethod
-    def _atomic_write(path: Path, data: dict[str, Any]) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-        try:
-            with temporary.open("w", encoding="utf-8") as handle:
-                json.dump(data, handle, ensure_ascii=False, indent=2)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary, path)
-        finally:
-            temporary.unlink(missing_ok=True)
 
     @staticmethod
     def _save_png(image: Any, path: Path) -> None:
@@ -206,7 +72,6 @@ class HistoryStorage:
         execution_id: str,
         images: Any,
         *,
-        persist: bool,
         timestamp: str,
         seed: Any,
         model: str,
@@ -221,16 +86,13 @@ class HistoryStorage:
             raise ValueError("images batch is empty")
 
         with self._lock_for(history_id):
-            volatile = self._volatile.setdefault(
-                history_id, self._empty_manifest(history_id)
+            history = self._histories.setdefault(
+                history_id, self._empty_history(history_id)
             )
-            persistent = self._load_persistent_unlocked(history_id) if persist else None
-            target = persistent if persistent is not None else volatile
-            target_persist = persist
             run = next(
                 (
                     item
-                    for item in target["runs"]
+                    for item in history["runs"]
                     if item["execution_id"] == execution_id
                 ),
                 None,
@@ -238,22 +100,9 @@ class HistoryStorage:
 
             created = run is None
             if created:
-                run_id = (
-                    max(target["next_run_id"], volatile["next_run_id"])
-                    if target_persist
-                    else volatile["next_run_id"]
-                )
-                base_dir = (
-                    self._persistent_dir(history_id)
-                    if persist
-                    else self._volatile_dir(history_id)
-                )
-                while (base_dir / f"run_{run_id:06d}").exists():
-                    run_id += 1
                 run = {
-                    "id": run_id,
+                    "id": history["next_run_id"],
                     "execution_id": execution_id,
-                    "persistent": target_persist,
                     "timestamp": timestamp,
                     "seeds": [],
                     "model": model or "Unknown",
@@ -264,17 +113,12 @@ class HistoryStorage:
                 }
 
             run_name = f"run_{run['id']:06d}"
-            base_dir = (
-                self._persistent_dir(history_id)
-                if target_persist
-                else self._volatile_dir(history_id)
-            )
-            final_dir = base_dir / run_name
+            final_dir = self._history_dir(history_id) / run_name
             final_dir.mkdir(parents=True, exist_ok=True)
             start_index = max(
                 (image.get("index", -1) for image in run["images"]), default=-1
             ) + 1
-            saved: list[tuple[Path, Path]] = []
+            staged: list[tuple[Path, Path]] = []
             committed: list[Path] = []
             try:
                 for offset, image in enumerate(images):
@@ -283,13 +127,13 @@ class HistoryStorage:
                     temporary_path = (
                         final_dir / f".{final_path.name}.{uuid.uuid4().hex}.tmp"
                     )
-                    saved.append((temporary_path, final_path))
+                    staged.append((temporary_path, final_path))
                     self._save_png(image, temporary_path)
-                for temporary_path, final_path in saved:
+                for temporary_path, final_path in staged:
                     os.replace(temporary_path, final_path)
                     committed.append(final_path)
             except Exception:
-                for temporary_path, _ in saved:
+                for temporary_path, _ in staged:
                     temporary_path.unlink(missing_ok=True)
                 for final_path in committed:
                     final_path.unlink(missing_ok=True)
@@ -298,15 +142,13 @@ class HistoryStorage:
                 raise
 
             prefix = (
-                f"generation_history/{history_id}/{run_name}"
-                if target_persist
-                else f"generation_history/{self.session_name}/{history_id}/{run_name}"
+                f"generation_history/{self.session_name}/{history_id}/{run_name}"
             )
             image_entries = [
                 {
                     "filename": f"image_{index:03d}.png",
                     "subfolder": prefix,
-                    "type": "output" if target_persist else "temp",
+                    "type": "temp",
                     "index": index,
                     "seed": seed,
                 }
@@ -330,100 +172,53 @@ class HistoryStorage:
             )
 
             if created:
-                target["runs"].insert(0, run)
-                target["next_run_id"] = run["id"] + 1
-            volatile["next_run_id"] = max(
-                volatile["next_run_id"], run["id"] + 1
-            )
-            if target_persist:
-                self._atomic_write(
-                    self._persistent_dir(history_id) / "manifest.json", target
-                )
+                history["runs"].insert(0, run)
+                history["next_run_id"] = run["id"] + 1
             return deepcopy(run), deepcopy(image_entries), created
 
-    def get_history(self, history_id: str, *, persist: bool) -> dict[str, Any]:
+    def get_history(self, history_id: str) -> dict[str, Any]:
         history_id = self.validate_history_id(history_id)
         with self._lock_for(history_id):
-            if persist:
-                return self._load_persistent_unlocked(history_id)
             return deepcopy(
-                self._volatile.get(history_id, self._empty_manifest(history_id))
+                self._histories.get(history_id, self._empty_history(history_id))
             )
 
-    def reset_volatile(self, history_id: str) -> int:
+    def reset(self, history_id: str) -> int:
         history_id = self.validate_history_id(history_id)
         with self._lock_for(history_id):
-            current = self._volatile.get(history_id)
+            current = self._histories.get(history_id)
             removed = len(current["runs"]) if current is not None else 0
-            volatile_dir = self._volatile_dir(history_id)
-            if volatile_dir.is_dir():
-                shutil.rmtree(volatile_dir, ignore_errors=True)
-            self._volatile[history_id] = self._empty_manifest(history_id)
+            shutil.rmtree(self._history_dir(history_id), ignore_errors=True)
+            self._histories[history_id] = self._empty_history(history_id)
             return removed
 
-    def delete_run(
-        self,
-        history_id: str,
-        run_id: Any,
-        *,
-        persistent: bool | None = None,
-    ) -> bool:
+    def delete_run(self, history_id: str, run_id: Any) -> bool:
         history_id = self.validate_history_id(history_id)
         run_id = self.validate_run_id(run_id)
-        found = False
         with self._lock_for(history_id):
-            if persistent is not False:
-                saved = self._load_persistent_unlocked(history_id)
-                kept = [run for run in saved["runs"] if run["id"] != run_id]
-                if len(kept) != len(saved["runs"]):
-                    saved["runs"] = kept
-                    self._atomic_write(
-                        self._persistent_dir(history_id) / "manifest.json", saved
-                    )
-                    shutil.rmtree(
-                        self._persistent_dir(history_id) / f"run_{run_id:06d}",
-                        ignore_errors=True,
-                    )
-                    found = True
-
-            if persistent is not True:
-                volatile = self._volatile.get(history_id)
-                if volatile is not None:
-                    kept = [run for run in volatile["runs"] if run["id"] != run_id]
-                    if len(kept) != len(volatile["runs"]):
-                        volatile["runs"] = kept
-                        shutil.rmtree(
-                            self._volatile_dir(history_id) / f"run_{run_id:06d}",
-                            ignore_errors=True,
-                        )
-                        found = True
-        return found
+            history = self._histories.get(history_id)
+            if history is None:
+                return False
+            kept = [run for run in history["runs"] if run["id"] != run_id]
+            if len(kept) == len(history["runs"]):
+                return False
+            history["runs"] = kept
+            shutil.rmtree(
+                self._history_dir(history_id) / f"run_{run_id:06d}",
+                ignore_errors=True,
+            )
+            return True
 
     def clear(self, history_id: str) -> int:
         history_id = self.validate_history_id(history_id)
         with self._lock_for(history_id):
-            persistent_dir = self._persistent_dir(history_id)
-            persistent = self._load_persistent_unlocked(history_id)
-            volatile = self._volatile.setdefault(
-                history_id, self._empty_manifest(history_id)
+            history = self._histories.setdefault(
+                history_id, self._empty_history(history_id)
             )
-            next_run_id = max(
-                persistent["next_run_id"], volatile["next_run_id"]
-            )
-
-            removed = len(persistent["runs"]) + len(volatile["runs"])
-            for base_dir in (persistent_dir, self._volatile_dir(history_id)):
-                if base_dir.is_dir():
-                    for child in base_dir.iterdir():
-                        if child.is_dir() and RUN_DIR_RE.fullmatch(child.name):
-                            shutil.rmtree(child, ignore_errors=True)
-
-            if persistent_dir.exists():
-                self._atomic_write(
-                    persistent_dir / "manifest.json",
-                    self._empty_manifest(history_id, next_run_id),
-                )
-            self._volatile[history_id] = self._empty_manifest(
+            removed = len(history["runs"])
+            next_run_id = history["next_run_id"]
+            shutil.rmtree(self._history_dir(history_id), ignore_errors=True)
+            self._histories[history_id] = self._empty_history(
                 history_id, next_run_id
             )
             return removed

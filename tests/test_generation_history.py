@@ -5,6 +5,7 @@ import sys
 import tempfile
 import types
 import unittest
+import uuid
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -29,7 +30,6 @@ sys.modules["aiohttp"] = types.SimpleNamespace(
     )
 )
 sys.modules["folder_paths"] = types.SimpleNamespace(
-    get_output_directory=lambda: str(Path(temp_root.name) / "output"),
     get_temp_directory=lambda: str(Path(temp_root.name) / "temp"),
 )
 execution_utils = types.ModuleType("comfy_execution.utils")
@@ -149,6 +149,29 @@ class MetadataTests(unittest.TestCase):
         fingerprint = generation_history.GenerationHistory.IS_CHANGED()
         self.assertTrue(math.isnan(fingerprint))
         self.assertNotEqual(fingerprint, fingerprint)
+
+    def test_record_keeps_the_image_pass_through_and_session_history(self):
+        original_storage = generation_history.STORAGE
+        storage = storage_module.HistoryStorage(Path(temp_root.name) / "record-temp")
+        storage._save_png = lambda _image, path: path.write_bytes(b"png")
+        generation_history.STORAGE = storage
+        images = [object()]
+        history_id = str(uuid.uuid4())
+        try:
+            result = generation_history.GenerationHistory().record(
+                images,
+                False,
+                history_id,
+                prompt={},
+                unique_id="1",
+            )
+        finally:
+            generation_history.STORAGE = original_storage
+
+        self.assertIs(result["result"][0], images)
+        run = storage.get_history(history_id)["runs"][0]
+        self.assertEqual(run["image_count"], 1)
+        self.assertEqual(run["images"][0]["type"], "temp")
 
 
 if __name__ == "__main__":

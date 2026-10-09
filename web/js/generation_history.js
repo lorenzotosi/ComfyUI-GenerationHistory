@@ -16,14 +16,16 @@ function getWidget(node, name) {
     return node.widgets?.find((widget) => widget.name === name);
 }
 
-function hideHistoryIdWidget(node) {
-    const widget = getWidget(node, "history_id");
-    if (!widget) return;
-    widget.hidden = true;
-    widget.options ??= {};
-    widget.options.hidden = true;
-    for (const key of ["element", "inputEl"]) {
-        if (widget[key]?.style) widget[key].style.display = "none";
+function hideInternalWidgets(node) {
+    for (const name of ["history_id", "persist_history"]) {
+        const widget = getWidget(node, name);
+        if (!widget) continue;
+        widget.hidden = true;
+        widget.options ??= {};
+        widget.options.hidden = true;
+        for (const key of ["element", "inputEl"]) {
+            if (widget[key]?.style) widget[key].style.display = "none";
+        }
     }
 }
 
@@ -64,7 +66,6 @@ function injectStyles() {
         .gh-header { box-sizing:border-box; width:100%; min-width:0; display:flex; align-items:flex-start; gap:7px; margin-bottom:5px; min-height:20px; }
         .gh-meta { flex:1 1 auto; min-width:0; white-space:normal; overflow-wrap:anywhere; line-height:1.35; }
         .gh-label { font-weight:700; }
-        .gh-saved { display:inline-block; margin-left:6px; padding:1px 5px; border:1px solid rgba(129,199,132,.7); border-radius:4px; color:#a5d6a7; background:rgba(46,125,50,.22); font-size:10px; font-weight:700; letter-spacing:.04em; vertical-align:1px; }
         .gh-delete { margin-left:auto; flex:0 0 auto; width:24px; padding:1px 5px; font-size:15px; line-height:18px; color:#ef9a9a; }
         .gh-images-scroll { box-sizing:border-box; width:100%; min-width:0; overflow-x:auto; overflow-y:hidden; padding-bottom:4px; overscroll-behavior-x:contain; }
         .gh-images { display:flex; flex-flow:row nowrap; gap:6px; width:max-content; }
@@ -109,7 +110,7 @@ function formatTimestamp(value) {
 function setupNode(node) {
     if (node._generationHistory) return;
     injectStyles();
-    hideHistoryIdWidget(node);
+    hideInternalWidgets(node);
 
     const controller = new AbortController();
     const state = { runs: [], rows: new Map(), revision: 0, modalRun: null, modalIndex: 0 };
@@ -202,13 +203,6 @@ function setupNode(node) {
             label.textContent = run.label;
             content.push(label);
         }
-        if (run.persistent) {
-            const saved = document.createElement("span");
-            saved.className = "gh-saved";
-            saved.textContent = "SAVED";
-            saved.title = "This run is stored in the ComfyUI output directory";
-            content.push(saved);
-        }
         content.push(document.createTextNode(`${content.length ? " · " : ""}${details.filter(Boolean).join(" · ")}`));
         meta.replaceChildren(...content);
         meta.title = meta.textContent;
@@ -245,7 +239,6 @@ function setupNode(node) {
                 await jsonRequest("/generation-history/delete-run", {
                     history_id: getWidget(node, "history_id")?.value,
                     run_id: run.id,
-                    persistent: Boolean(run.persistent),
                 });
                 state.runs = state.runs.filter((item) => runKey(item) !== runKey(run));
                 state.rows.delete(runKey(run));
@@ -334,10 +327,9 @@ function setupNode(node) {
     async function loadHistory(mergeCurrent = false) {
         const historyId = String(getWidget(node, "history_id")?.value || "");
         if (!UUID_RE.test(historyId)) return;
-        const persist = Boolean(getWidget(node, "persist_history")?.value);
         const revision = state.revision;
         try {
-            const response = await api.fetchApi(`/generation-history/history?id=${encodeURIComponent(historyId)}&persist=${persist ? 1 : 0}`);
+            const response = await api.fetchApi(`/generation-history/history?id=${encodeURIComponent(historyId)}`);
             const data = await response.json();
             if (!response.ok) throw new Error(data.error || response.statusText);
             if (!mergeCurrent && revision === state.revision) {
@@ -362,32 +354,17 @@ function setupNode(node) {
 
         initializedHistoryId = historyId;
         initializationPromise = (async () => {
-            const persist = Boolean(getWidget(node, "persist_history")?.value);
-            if (!persist) {
-                await jsonRequest("/generation-history/reset-volatile", {
-                    history_id: historyId,
-                });
-                state.revision = 0;
-                renderAll([]);
-            }
+            await jsonRequest("/generation-history/reset", {
+                history_id: historyId,
+            });
+            state.revision = 0;
+            renderAll([]);
             await loadHistory();
         })().catch((error) => {
             scroll.innerHTML = '<div class="gh-error"></div>';
             scroll.firstElementChild.textContent = `Unable to initialize history: ${error.message}`;
         });
         return initializationPromise;
-    }
-
-    const persistWidget = getWidget(node, "persist_history");
-    const previousPersistCallback = persistWidget?.callback;
-    if (persistWidget) {
-        persistWidget.callback = function () {
-            const result = previousPersistCallback?.apply(this, arguments);
-            if (Boolean(persistWidget.value)) {
-                queueMicrotask(() => loadHistory(true));
-            }
-            return result;
-        };
     }
 
     root.querySelector(".gh-clear").addEventListener("click", async () => {
@@ -461,7 +438,6 @@ function setupNode(node) {
         resizeObserver.disconnect();
         controller.abort();
         modal.remove();
-        if (persistWidget) persistWidget.callback = previousPersistCallback;
         previousRemoved?.apply(this, arguments);
     };
     const previousAdded = node.onAdded;
@@ -489,7 +465,7 @@ app.registerExtension({
     async afterConfigureGraph() {
         for (const node of app.graph?._nodes || []) {
             if (node.comfyClass !== NODE_CLASS) continue;
-            hideHistoryIdWidget(node);
+            hideInternalWidgets(node);
             if (ensureUniqueHistoryId(node)) node._generationHistory?.reload();
         }
     },

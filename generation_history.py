@@ -16,9 +16,7 @@ from .storage import HistoryStorage
 
 LOGGER = logging.getLogger(__name__)
 EVENT_NAME = "generation_history.run_added"
-STORAGE = HistoryStorage(
-    folder_paths.get_output_directory(), folder_paths.get_temp_directory()
-)
+STORAGE = HistoryStorage(folder_paths.get_temp_directory())
 
 SEED_KEYS = ("seed", "noise_seed")
 MODEL_KEYS = ("unet_name", "ckpt_name", "model_name", "checkpoint_name")
@@ -158,13 +156,7 @@ routes = PromptServer.instance.routes
 async def get_generation_history(request: web.Request) -> web.Response:
     try:
         history_id = request.query.get("id", "")
-        persist = request.query.get("persist", "0").lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
-        return web.json_response(STORAGE.get_history(history_id, persist=persist))
+        return web.json_response(STORAGE.get_history(history_id))
     except ValueError as exc:
         return web.json_response({"error": str(exc)}, status=400)
     except OSError as exc:
@@ -179,20 +171,20 @@ async def _request_json(request: web.Request) -> dict[str, Any]:
     return data
 
 
-@routes.post("/generation-history/reset-volatile")
-async def reset_volatile_generation_history(request: web.Request) -> web.Response:
+@routes.post("/generation-history/reset")
+async def reset_generation_history(request: web.Request) -> web.Response:
     try:
         data = await _request_json(request)
-        removed = STORAGE.reset_volatile(data.get("history_id", ""))
+        removed = STORAGE.reset(data.get("history_id", ""))
         LOGGER.info(
-            "[GenerationHistory] Reset volatile history (%s runs removed)",
+            "[GenerationHistory] Reset history (%s runs removed)",
             removed,
         )
         return web.json_response({"ok": True, "removed": removed})
     except (ValueError, web.HTTPBadRequest) as exc:
         return web.json_response({"error": str(exc)}, status=400)
     except OSError as exc:
-        LOGGER.exception("[GenerationHistory] Unable to reset volatile history")
+        LOGGER.exception("[GenerationHistory] Unable to reset history")
         return web.json_response({"error": str(exc)}, status=500)
 
 
@@ -200,13 +192,9 @@ async def reset_volatile_generation_history(request: web.Request) -> web.Respons
 async def delete_generation_history_run(request: web.Request) -> web.Response:
     try:
         data = await _request_json(request)
-        persistent = data.get("persistent")
-        if persistent is not None and not isinstance(persistent, bool):
-            raise ValueError("persistent must be a boolean")
         deleted = STORAGE.delete_run(
             data.get("history_id", ""),
             data.get("run_id"),
-            persistent=persistent,
         )
         if not deleted:
             return web.json_response({"error": "run not found"}, status=404)
@@ -239,12 +227,12 @@ class GenerationHistory:
         return {
             "required": {
                 "images": ("IMAGE",),
+                # shortcut: keep this inert widget so old workflow values do not shift; remove in a breaking schema version.
                 "persist_history": (
                     "BOOLEAN",
                     {
                         "default": False,
-                        "label_on": "persist on",
-                        "label_off": "persist off",
+                        "advanced": True,
                     },
                 ),
                 "history_id": (
@@ -299,7 +287,7 @@ class GenerationHistory:
         extra_pnginfo: Any = None,
         unique_id: Any = None,
     ) -> dict[str, Any] | tuple[Any]:
-        del extra_pnginfo
+        del extra_pnginfo, persist_history
         try:
             try:
                 history_id = HistoryStorage.validate_history_id(history_id)
@@ -314,7 +302,6 @@ class GenerationHistory:
                 history_id,
                 execution_id,
                 images,
-                persist=bool(persist_history),
                 timestamp=datetime.now().astimezone().isoformat(timespec="seconds"),
                 seed=seed,
                 model=model,
@@ -324,7 +311,6 @@ class GenerationHistory:
             payload = {
                 "history_id": history_id,
                 "node_id": str(unique_id),
-                "persist": bool(persist_history),
                 "execution_id": execution_id,
                 "run_id": run["id"],
                 "is_new": created,
@@ -345,10 +331,6 @@ class GenerationHistory:
                 len(new_images),
                 run["image_count"],
             )
-        except Exception as exc:
+        except Exception:
             LOGGER.exception("[GenerationHistory] Unable to record generation")
-            if persist_history:
-                raise RuntimeError(
-                    f"Generation History could not persist this run: {exc}"
-                ) from exc
         return {"result": (images,)}
