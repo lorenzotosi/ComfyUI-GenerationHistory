@@ -27,4 +27,15 @@ Select a thumbnail to open the full-resolution image.
 
 Use the delete button on a run to remove that run, or **Clear** to remove all
 history belonging to this node. The gallery uses temporary session storage and
-starts empty when the workflow is opened or reloaded.
+starts empty when the workflow is opened or reloaded. Removing the node releases
+its history and temporary images. Use **Save Image** to keep images beyond the
+gallery session.
+
+Each node instance has its own gallery, including instances of the same workflow
+opened in different browser tabs. Clear and Delete operations are performed in
+order when another history operation is still running.
+
+Full-resolution images are stored as temporary PNGs to keep the server's memory
+usage low. They are not saved in the workflow or restored after restarting
+ComfyUI. If deleting files fails, an error is shown and the history remains
+available for another cleanup attempt.

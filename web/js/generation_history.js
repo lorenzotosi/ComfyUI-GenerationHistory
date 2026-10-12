@@ -31,16 +31,9 @@ function hideInternalWidgets(node) {
 
 function ensureUniqueHistoryId(node) {
     const widget = getWidget(node, "history_id");
-    if (!widget) return false;
-
-    let value = String(widget.value || "");
-    const nodes = app.graph?._nodes || [];
-    const index = nodes.indexOf(node);
-    const duplicateBefore = nodes.slice(0, Math.max(0, index)).some((other) =>
-        other?.comfyClass === NODE_CLASS && String(getWidget(other, "history_id")?.value || "") === value,
-    );
-    if (!UUID_RE.test(value) || duplicateBefore) {
-        value = newUuid();
+    const value = node._generationHistory?.historyId;
+    if (!widget || !value) return false;
+    if (widget.value !== value) {
         widget.value = value;
         node.setDirtyCanvas?.(true, true);
         return true;
@@ -82,20 +75,21 @@ function injectStyles() {
     document.head.append(style);
 }
 
-function imageUrl(image) {
+function imageUrl(image, thumbnail = false) {
     const query = new URLSearchParams({
-        filename: image.filename,
+        filename: thumbnail ? image.thumbnail || image.filename : image.filename,
         subfolder: image.subfolder,
         type: image.type,
     });
     return api.apiURL(`/view?${query}`);
 }
 
-async function jsonRequest(path, body) {
+async function jsonRequest(path, body, keepalive = false) {
     const response = await api.fetchApi(path, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
+        keepalive,
     });
     const data = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(data.error || `${response.status} ${response.statusText}`);
@@ -113,9 +107,14 @@ function setupNode(node) {
     hideInternalWidgets(node);
 
     const controller = new AbortController();
-    const state = { runs: [], rows: new Map(), revision: 0, modalRun: null, modalIndex: 0 };
+    const state = {
+        runs: [], rows: new Map(), revision: 0, modalRun: null, modalIndex: 0,
+        generation: null, requestVersion: 0, loadRequest: 0, mutating: false,
+        pendingEvents: [], deletedRuns: new Set(), removed: false,
+    };
     let initializedHistoryId = null;
     let initializationPromise = null;
+    let mutationPromise = null;
     const root = document.createElement("div");
     root.className = "gh-root";
     root.innerHTML = `
@@ -168,7 +167,8 @@ function setupNode(node) {
         state.modalRun = null;
     }
 
-    const runKey = (run) => String(run.execution_id || `legacy:${run.id}`);
+    const runKey = (run) => String(run.execution_id);
+    const imageKey = (image) => `${image.subfolder}/${image.filename}`;
 
     function updateRowSize(ref) {
         const available = ref.scroller.clientWidth;
@@ -184,7 +184,7 @@ function setupNode(node) {
 
     function updateHeader(ref) {
         const { run, meta } = ref;
-        const seeds = run.seeds?.length ? run.seeds : [run.seed ?? "Unknown"];
+        const seeds = run.seeds?.length ? run.seeds : ["Unknown"];
         const seedLabel = seeds.length > 1 ? "Seeds" : "Seed";
         const loras = (run.loras || []).map((lora) =>
             `${lora.name}${lora.strength_model == null ? "" : ` @ ${lora.strength_model}`}`,
@@ -214,7 +214,7 @@ function setupNode(node) {
         thumbnail.loading = "lazy";
         thumbnail.draggable = false;
         thumbnail.alt = `Generation image ${index + 1}`;
-        thumbnail.src = imageUrl(image);
+        thumbnail.src = imageUrl(image, true);
         thumbnail.dataset.imageKey = `${image.subfolder}/${image.filename}`;
         thumbnail.addEventListener("click", () => openModal(ref.run, index), { signal: controller.signal });
         ref.strip.append(thumbnail);
@@ -236,15 +236,7 @@ function setupNode(node) {
         deleteButton.title = "Delete generation";
         deleteButton.addEventListener("click", async () => {
             try {
-                await jsonRequest("/generation-history/delete-run", {
-                    history_id: getWidget(node, "history_id")?.value,
-                    run_id: run.id,
-                });
-                state.runs = state.runs.filter((item) => runKey(item) !== runKey(run));
-                state.rows.delete(runKey(run));
-                row.remove();
-                if (!state.runs.length) scroll.innerHTML = '<div class="gh-empty">No generations yet</div>';
-                updateStats();
+                await changeHistory("/generation-history/delete-run", { run_id: run.id });
             } catch (error) {
                 window.alert(`Generation History: ${error.message}`);
             }
@@ -269,6 +261,11 @@ function setupNode(node) {
         state.runs = [...runs].sort((a, b) =>
             (a.id - b.id) || (new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()),
         );
+        if (state.modalRun) {
+            const key = runKey(state.modalRun);
+            state.modalRun = state.runs.find((run) => runKey(run) === key) || null;
+            updateModal();
+        }
         state.rows.clear();
         scroll.replaceChildren();
         if (!state.runs.length) {
@@ -328,52 +325,110 @@ function setupNode(node) {
         const historyId = String(getWidget(node, "history_id")?.value || "");
         if (!UUID_RE.test(historyId)) return;
         const revision = state.revision;
+        const version = state.requestVersion;
+        const request = ++state.loadRequest;
         try {
             const response = await api.fetchApi(`/generation-history/history?id=${encodeURIComponent(historyId)}`);
             const data = await response.json();
+            if (state.removed || version !== state.requestVersion || request !== state.loadRequest) return;
             if (!response.ok) throw new Error(data.error || response.statusText);
+            if (data.generation !== state.generation) return;
             if (!mergeCurrent && revision === state.revision) {
                 renderAll(data.runs || []);
             } else {
                 const merged = new Map((data.runs || []).map((run) => [runKey(run), run]));
-                state.runs.forEach((run) => merged.set(runKey(run), run));
+                state.runs.forEach((run) => {
+                    const serverRun = merged.get(runKey(run));
+                    const images = new Map((serverRun?.images || []).map((image) => [imageKey(image), image]));
+                    (run.images || []).forEach((image) => images.set(imageKey(image), image));
+                    const ordered = [...images.values()].sort((a, b) => a.index - b.index);
+                    merged.set(runKey(run), {
+                        ...(Number(serverRun?.image_count || 0) > Number(run.image_count || 0) ? serverRun : run),
+                        images: ordered,
+                        image_count: ordered.length,
+                    });
+                });
                 renderAll([...merged.values()]);
             }
         } catch (error) {
+            if (state.removed || version !== state.requestVersion || request !== state.loadRequest) return;
             scroll.innerHTML = `<div class="gh-error"></div>`;
             scroll.firstElementChild.textContent = `Unable to load history: ${error.message}`;
         }
     }
 
-    function initializeHistory(force = false) {
+    function initializeHistory() {
         const historyId = String(getWidget(node, "history_id")?.value || "");
-        if (!UUID_RE.test(historyId)) return Promise.resolve();
-        if (!force && initializedHistoryId === historyId && initializationPromise) {
+        if (state.removed || !UUID_RE.test(historyId)) return Promise.resolve();
+        if (initializedHistoryId === historyId && initializationPromise) {
             return initializationPromise;
         }
 
         initializedHistoryId = historyId;
+        state.generation = newUuid().replaceAll("-", "");
+        state.requestVersion += 1;
+        state.mutating = true;
+        const generation = state.generation;
         initializationPromise = (async () => {
             await jsonRequest("/generation-history/reset", {
                 history_id: historyId,
+                generation,
             });
+            if (state.removed || state.generation !== generation) return;
             state.revision = 0;
+            state.deletedRuns.clear();
+            closeModal();
             renderAll([]);
             await loadHistory();
         })().catch((error) => {
+            if (state.removed || state.generation !== generation) return;
             scroll.innerHTML = '<div class="gh-error"></div>';
             scroll.firstElementChild.textContent = `Unable to initialize history: ${error.message}`;
+        }).finally(() => {
+            if (state.generation === generation) finishMutation();
         });
         return initializationPromise;
+    }
+
+    function finishMutation() {
+        state.mutating = false;
+        const pending = state.pendingEvents;
+        state.pendingEvents = [];
+        pending.forEach(eventHandler);
+    }
+
+    function changeHistory(path, body = {}, clearAll = false) {
+        if (state.removed) return Promise.resolve();
+        if (state.mutating) {
+            return Promise.allSettled([initializationPromise, mutationPromise])
+                .then(() => changeHistory(path, body, clearAll));
+        }
+        state.requestVersion += 1;
+        state.mutating = true;
+        const generation = clearAll ? newUuid().replaceAll("-", "") : state.generation;
+        mutationPromise = (async () => {
+            await jsonRequest(path, {
+                ...body, history_id: getWidget(node, "history_id")?.value,
+                ...(clearAll ? { generation } : {}),
+            });
+            if (clearAll) {
+                state.generation = generation;
+                state.deletedRuns.clear();
+            } else {
+                state.deletedRuns.add(String(body.run_id));
+            }
+            if (state.removed) return;
+            renderAll(clearAll ? [] : state.runs.filter((run) => String(run.id) !== String(body.run_id)));
+            closeModal();
+            if (!state.removed) await loadHistory();
+        })().finally(finishMutation);
+        return mutationPromise;
     }
 
     root.querySelector(".gh-clear").addEventListener("click", async () => {
         if (!window.confirm("Clear all generation history?")) return;
         try {
-            await jsonRequest("/generation-history/clear", {
-                history_id: getWidget(node, "history_id")?.value,
-            });
-            renderAll([]);
+            await changeHistory("/generation-history/clear", {}, true);
         } catch (error) {
             window.alert(`Generation History: ${error.message}`);
         }
@@ -406,6 +461,7 @@ function setupNode(node) {
     }
 
     const eventHandler = (event) => {
+        if (state.removed) return;
         const payload = event.detail;
         if (!payload?.run) return;
         let historyId = String(getWidget(node, "history_id")?.value || "");
@@ -414,10 +470,21 @@ function setupNode(node) {
             historyId = payload.history_id;
         }
         if (payload.history_id !== historyId) return;
+        if (state.mutating) {
+            state.pendingEvents.push(event);
+            return;
+        }
+        if (payload.run.generation !== state.generation || state.deletedRuns.has(String(payload.run.id))) return;
         state.revision += 1;
         updateRun(payload.run, payload.new_images || []);
     };
     api.addEventListener(EVENT_NAME, eventHandler);
+    window.addEventListener("pagehide", (event) => {
+        if (event.persisted || state.removed || !initializedHistoryId) return;
+        jsonRequest("/generation-history/release", {
+            history_id: initializedHistoryId, generation: state.generation,
+        }, true).catch((error) => console.error(`Generation History: ${error.message}`));
+    }, { signal: controller.signal });
 
     node.addDOMWidget("generation_history_gallery", "generation_history", root, {
         serialize: false,
@@ -434,24 +501,49 @@ function setupNode(node) {
     const resizeObserver = new ResizeObserver(() => updateAllRowSizes());
     resizeObserver.observe(root);
     node.onRemoved = function () {
+        state.removed = true;
+        state.requestVersion += 1;
+        const historyId = initializedHistoryId;
+        Promise.allSettled([initializationPromise, mutationPromise]).then(() => {
+            if (!UUID_RE.test(historyId) || !state.generation) return;
+            return jsonRequest("/generation-history/release", {
+                history_id: historyId, generation: state.generation,
+            });
+        }).catch((error) => console.error(`Generation History: ${error.message}`));
         api.removeEventListener(EVENT_NAME, eventHandler);
         resizeObserver.disconnect();
         controller.abort();
+        state.pendingEvents = [];
+        state.rows.clear();
+        state.runs = [];
+        closeModal();
         modal.remove();
+        node.onAdded = function () {
+            const result = previousAdded?.apply(this, arguments);
+            node.onAdded = previousAdded;
+            node.onRemoved = previousRemoved;
+            node._generationHistory = null;
+            node.widgets = node.widgets.filter((widget) => widget.name !== "generation_history_gallery");
+            root.remove();
+            setupNode(node);
+            return result;
+        };
         previousRemoved?.apply(this, arguments);
     };
     const previousAdded = node.onAdded;
     node.onAdded = function () {
         const result = previousAdded?.apply(this, arguments);
         queueMicrotask(() => {
+            if (state.removed) return;
             ensureUniqueHistoryId(node);
             initializeHistory();
         });
         return result;
     };
 
-    node._generationHistory = { reload: () => initializeHistory(true) };
+    node._generationHistory = { historyId: newUuid(), reload: () => initializeHistory() };
     queueMicrotask(() => {
+        if (state.removed) return;
         ensureUniqueHistoryId(node);
         initializeHistory();
     });
@@ -466,7 +558,8 @@ app.registerExtension({
         for (const node of app.graph?._nodes || []) {
             if (node.comfyClass !== NODE_CLASS) continue;
             hideInternalWidgets(node);
-            if (ensureUniqueHistoryId(node)) node._generationHistory?.reload();
+            ensureUniqueHistoryId(node);
+            node._generationHistory?.reload();
         }
     },
 });

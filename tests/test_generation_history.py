@@ -6,10 +6,16 @@ import tempfile
 import types
 import unittest
 import uuid
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
 PACKAGE = "generation_history_test_package"
+
+
+def save_png_stub(_image, path):
+    path.write_bytes(b"png")
+    path.with_suffix(".thumb.jpg").write_bytes(b"jpg")
 
 
 class _Routes:
@@ -153,7 +159,7 @@ class MetadataTests(unittest.TestCase):
     def test_record_keeps_the_image_pass_through_and_session_history(self):
         original_storage = generation_history.STORAGE
         storage = storage_module.HistoryStorage(Path(temp_root.name) / "record-temp")
-        storage._save_png = lambda _image, path: path.write_bytes(b"png")
+        storage._save_png = save_png_stub
         generation_history.STORAGE = storage
         images = [object()]
         history_id = str(uuid.uuid4())
@@ -172,6 +178,69 @@ class MetadataTests(unittest.TestCase):
         run = storage.get_history(history_id)["runs"][0]
         self.assertEqual(run["image_count"], 1)
         self.assertEqual(run["images"][0]["type"], "temp")
+
+    def test_routes_delegate_storage_operations_to_thread_executor(self):
+        storage = storage_module.HistoryStorage(Path(temp_root.name) / "route-temp")
+        storage._save_png = save_png_stub
+        history_id = str(uuid.uuid4())
+        calls = []
+        async def executor(function, *args):
+            calls.append(function.__name__)
+            return function(*args)
+        async def request_json():
+            return {
+                "history_id": history_id, "run_id": 1,
+                "generation": storage.get_history(history_id)["generation"],
+            }
+        request = types.SimpleNamespace(query={"id": history_id}, json=request_json)
+        routes = [
+            generation_history.get_generation_history,
+            generation_history.reset_generation_history,
+            generation_history.delete_generation_history_run,
+            generation_history.clear_generation_history,
+            generation_history.release_generation_history,
+        ]
+        with patch.object(generation_history, "STORAGE", storage), patch.object(generation_history.asyncio, "to_thread", executor):
+            for route in routes:
+                storage.reset(history_id)
+                storage.append_images(
+                    history_id, "prompt", [object()], timestamp="now",
+                    seed=1, model="model", loras=[], label="",
+                )
+                with self.assertRaises(StopIteration) as completed:
+                    route(request).send(None)
+                self.assertEqual(completed.exception.value[1], 200)
+        self.assertEqual(calls, ["get_history", "reset", "delete_run", "clear", "release"])
+
+    def test_delete_route_reports_disk_error_and_preserves_the_run(self):
+        storage = storage_module.HistoryStorage(Path(temp_root.name) / "route-error")
+        storage._save_png = save_png_stub
+        history_id = str(uuid.uuid4())
+        storage.append_images(
+            history_id, "prompt", [object()], timestamp="now",
+            seed=1, model="model", loras=[], label="",
+        )
+        async def executor(function, *args):
+            return function(*args)
+        async def request_json():
+            return {"history_id": history_id, "run_id": 1}
+        with patch.object(generation_history, "STORAGE", storage), patch.object(generation_history.asyncio, "to_thread", executor), patch.object(storage_module.shutil, "rmtree", side_effect=PermissionError("locked")):
+            with self.assertLogs(generation_history.LOGGER, level="ERROR"):
+                with self.assertRaises(StopIteration) as completed:
+                    generation_history.delete_generation_history_run(types.SimpleNamespace(json=request_json)).send(None)
+        self.assertEqual(completed.exception.value, ({"error": "locked"}, 500))
+        self.assertEqual(len(storage.get_history(history_id)["runs"]), 1)
+
+    def test_record_does_not_publish_images_after_gallery_release(self):
+        storage = storage_module.HistoryStorage(Path(temp_root.name) / "released-temp")
+        history_id = str(uuid.uuid4())
+        storage.reset(history_id)
+        storage.release(history_id, storage.get_history(history_id)["generation"])
+        images = [object()]
+        with patch.object(generation_history, "STORAGE", storage), patch.object(generation_history.PromptServer.instance, "send_sync") as publish:
+            result = generation_history.GenerationHistory().record(images, False, history_id)
+        self.assertIs(result["result"][0], images)
+        publish.assert_not_called()
 
 
 if __name__ == "__main__":

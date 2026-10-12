@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from collections import deque
@@ -156,7 +157,8 @@ routes = PromptServer.instance.routes
 async def get_generation_history(request: web.Request) -> web.Response:
     try:
         history_id = request.query.get("id", "")
-        return web.json_response(STORAGE.get_history(history_id))
+        history = await asyncio.to_thread(STORAGE.get_history, history_id)
+        return web.json_response(history)
     except ValueError as exc:
         return web.json_response({"error": str(exc)}, status=400)
     except OSError as exc:
@@ -175,7 +177,9 @@ async def _request_json(request: web.Request) -> dict[str, Any]:
 async def reset_generation_history(request: web.Request) -> web.Response:
     try:
         data = await _request_json(request)
-        removed = STORAGE.reset(data.get("history_id", ""))
+        removed = await asyncio.to_thread(
+            STORAGE.reset, data.get("history_id", ""), data.get("generation"),
+        )
         LOGGER.info(
             "[GenerationHistory] Reset history (%s runs removed)",
             removed,
@@ -192,7 +196,8 @@ async def reset_generation_history(request: web.Request) -> web.Response:
 async def delete_generation_history_run(request: web.Request) -> web.Response:
     try:
         data = await _request_json(request)
-        deleted = STORAGE.delete_run(
+        deleted = await asyncio.to_thread(
+            STORAGE.delete_run,
             data.get("history_id", ""),
             data.get("run_id"),
         )
@@ -211,13 +216,30 @@ async def delete_generation_history_run(request: web.Request) -> web.Response:
 async def clear_generation_history(request: web.Request) -> web.Response:
     try:
         data = await _request_json(request)
-        removed = STORAGE.clear(data.get("history_id", ""))
+        removed = await asyncio.to_thread(
+            STORAGE.clear, data.get("history_id", ""), data.get("generation"),
+        )
         LOGGER.info("[GenerationHistory] Cleared %s runs", removed)
         return web.json_response({"ok": True, "removed": removed})
     except (ValueError, web.HTTPBadRequest) as exc:
         return web.json_response({"error": str(exc)}, status=400)
     except OSError as exc:
         LOGGER.exception("[GenerationHistory] Unable to clear history")
+        return web.json_response({"error": str(exc)}, status=500)
+
+
+@routes.post("/generation-history/release")
+async def release_generation_history(request: web.Request) -> web.Response:
+    try:
+        data = await _request_json(request)
+        removed = await asyncio.to_thread(
+            STORAGE.release, data.get("history_id", ""), data.get("generation", ""),
+        )
+        return web.json_response({"ok": True, "removed": removed})
+    except (ValueError, web.HTTPBadRequest) as exc:
+        return web.json_response({"error": str(exc)}, status=400)
+    except OSError as exc:
+        LOGGER.exception("[GenerationHistory] Unable to release history")
         return web.json_response({"error": str(exc)}, status=500)
 
 
@@ -308,6 +330,8 @@ class GenerationHistory:
                 loras=metadata["loras"],
                 label=str(run_label or "").strip(),
             )
+            if run is None:
+                return {"result": (images,)}
             payload = {
                 "history_id": history_id,
                 "node_id": str(unique_id),
